@@ -23,10 +23,11 @@ const (
 
 	TagHistoryCommit = 1
 
-	TagNodePath  = 1 << 0
+	TagNodeKey   = 1 << 0
 	TagNodeValue = 1 << 1
 	TagNodeRef   = 1 << 2
 	TagNodeChild = 1 << 3
+	tagNodeMerge = 1 << 4 // inner use
 
 	TagPublishCommit = 1
 
@@ -74,6 +75,13 @@ func uvarintSize(x int) int {
 func writeUvarint(w *Buffer, v int) {
 	size := uvarintSize(v)
 	binary.PutUvarint(w.NextBytes(size), uint64(v))
+}
+
+func chstr(ch int) string {
+	if ch == -1 {
+		return "-1"
+	}
+	return string([]byte{byte(ch)})
 }
 
 type ProtoReader struct {
@@ -130,8 +138,9 @@ func (r *ProtoReader) EOF() bool {
 }
 
 type Node struct {
+	Flags      byte
+	OffIsAbs   bool
 	Off        int32
-	Off1       int32
 	ChildStart int32
 	ChildNr    int32
 	RefOff     int32
@@ -141,6 +150,55 @@ type Node struct {
 	ValueSlot  int32
 	ValueOff   int32
 	ValueLen   int32
+}
+
+type MergeNode struct {
+	Off0    int32
+	Off1    int32
+	KeyOff0 int32
+	KeyOff1 int32
+	KeyLen0 int32
+	KeyLen1 int32
+}
+
+func FromMergeNode(n MergeNode) Node {
+	return Node{
+		Flags:      tagNodeMerge,
+		Off:        n.Off0,
+		ChildStart: n.Off1,
+		ChildNr:    n.KeyOff0,
+		RefOff:     n.KeyOff1,
+		KeyOff:     n.KeyLen0,
+		KeyLen:     n.KeyLen1,
+	}
+}
+
+func ToMergeNode(n Node) MergeNode {
+	return MergeNode{
+		Off0:    n.Off,
+		Off1:    n.ChildStart,
+		KeyOff0: n.ChildNr,
+		KeyOff1: n.RefOff,
+		KeyLen0: n.KeyOff,
+		KeyLen1: n.KeyLen,
+	}
+}
+
+type OplogNode struct {
+	OplogStart int32
+	OplogNr    int32
+	LevelStart int32
+	LevelLen   int32
+	KeyOff     int32
+	KeyLen     int32
+}
+
+func (n Node) Value(slots [][]byte) []byte {
+	return slots[int(n.ValueSlot)][int(n.ValueOff):int(n.ValueOff+n.ValueLen)]
+}
+
+func (n Node) Key(slots [][]byte) []byte {
+	return slots[0][int(n.KeyOff):int(n.KeyOff+n.KeyLen)]
 }
 
 type TreeWriter struct {
@@ -191,10 +249,10 @@ func searchOplogs(tw *TreeWriter, slots [][]byte, oplogs []Node, ni int, oplogst
 			if last == -2 {
 			} else if last == -1 {
 				o := oplogs[oi-1]
-				n.ValueOp = o.ValueOp
-				n.ValueSlot = o.ValueSlot
-				n.ValueOff = o.ValueOff
-				n.ValueLen = o.ValueLen
+				nodeCopyValue(n, o)
+				if debugBuildCommitTree {
+					fmt.Println("set value", "ni", ni, "value", string(n.Value(slots)))
+				}
 			} else {
 				if debugBuildCommitTree {
 					fmt.Println("cont", cont, "ch", string([]byte{byte(last)}))
@@ -204,6 +262,7 @@ func searchOplogs(tw *TreeWriter, slots [][]byte, oplogs []Node, ni int, oplogst
 					return true
 				} else {
 					tw.Nodes = append(tw.Nodes, Node{
+						Flags:      TagNodeChild | TagNodeKey,
 						ChildStart: int32(oi - cont),
 						ChildNr:    int32(cont),
 						KeyOff:     int32(levelEnd),
@@ -235,6 +294,7 @@ func BuildCommitTree(tw *TreeWriter, slots [][]byte, oplogs []Node) {
 
 	tw.Nodes = tw.Nodes[:0]
 	tw.Nodes = append(tw.Nodes, Node{
+		Flags:      TagNodeChild,
 		ChildStart: 0,
 		ChildNr:    int32(len(oplogs)),
 	})
@@ -251,13 +311,11 @@ func BuildCommitTree(tw *TreeWriter, slots [][]byte, oplogs []Node) {
 		n := &tw.Nodes[ni]
 		o := oplogs[int(n.ChildStart)]
 		if n.ChildNr == 1 {
-			n.ValueOp = int32(o.ValueOp)
-			n.ValueSlot = o.ValueSlot
-			n.ValueOff = o.ValueOff
-			n.ValueLen = o.ValueLen
+			nodeCopyValue(n, o)
 			levelStart := n.KeyOff
 			n.KeyOff = o.KeyOff + levelStart
 			n.KeyLen = o.KeyLen - levelStart
+			n.Flags |= TagNodeKey
 			n.ChildNr = 0
 		} else {
 			oplogstart := int(n.ChildStart)
@@ -269,6 +327,7 @@ func BuildCommitTree(tw *TreeWriter, slots [][]byte, oplogs []Node) {
 			n := &tw.Nodes[ni]
 			levelStart := n.KeyOff
 			n.KeyOff = o.KeyOff + levelStart
+			n.Flags |= TagNodeKey
 		}
 	}
 }
@@ -297,7 +356,7 @@ func (tw *TreeWriter) Write(w *SnapshotRewriter) int {
 	for ni := len(tw.Nodes) - 1; ni >= 0; ni-- {
 		n := &tw.Nodes[ni]
 
-		if n.KeyLen == 0 && n.RefOff == 0 && n.ValueOp == 0 && n.ChildNr == 0 {
+		if n.Flags&(TagNodeKey|TagNodeRef|TagNodeChild|TagNodeValue) == 0 {
 			continue
 		}
 
@@ -311,9 +370,9 @@ func (tw *TreeWriter) Write(w *SnapshotRewriter) int {
 		flagsoff := tw.treeb.Len()
 		tw.treeb.NextBytes(1)
 
-		// path
-		if n.KeyLen > 0 {
-			flags |= TagNodePath
+		// key
+		if n.Flags&TagNodeKey != 0 && n.KeyLen > 0 {
+			flags |= TagNodeKey
 			writeUvarint(&tw.treeb, int(n.KeyLen))
 			path := w.OrigSlots[0][int(n.KeyOff):int(n.KeyOff+n.KeyLen)]
 			tw.treeb.Write(path)
@@ -323,13 +382,13 @@ func (tw *TreeWriter) Write(w *SnapshotRewriter) int {
 		}
 
 		// ref
-		if n.RefOff != 0 {
+		if n.Flags&TagNodeRef != 0 {
 			flags |= TagNodeRef
 			writeUvarint(&tw.treeb, int(n.RefOff))
 		}
 
 		// value
-		if n.ValueOp != 0 {
+		if n.Flags&TagNodeValue != 0 {
 			flags |= TagNodeValue
 			tw.treeb.WriteByte(byte(n.ValueOp))
 			if debugBuildCommitTree {
@@ -348,7 +407,7 @@ func (tw *TreeWriter) Write(w *SnapshotRewriter) int {
 		}
 
 		// child
-		if n.ChildNr > 0 {
+		if n.Flags&TagNodeChild != 0 && n.ChildNr > 0 {
 			flags |= TagNodeChild
 
 			ptrsize := 1
@@ -366,11 +425,9 @@ func (tw *TreeWriter) Write(w *SnapshotRewriter) int {
 				c := tw.Nodes[ci]
 				ch := w.OrigSlots[0][int(c.KeyOff)]
 				tw.treeb.WriteByte(ch)
-				var off int
-				if c.Off1 != 0 {
-					off = -(w.Slot0Size - int(c.Off1))
-				} else {
-					off = int(c.Off)
+				off := int(c.Off)
+				if c.OffIsAbs {
+					off = -(w.Slot0Size - off)
 				}
 				ptr := tw.treeb.Len() - off
 				putInt(tw.treeb.NextBytes(ptrsize), ptr, ptrsize)
@@ -402,7 +459,7 @@ func readNodeKeyOff(t []byte, off int) int32 {
 	r := ProtoReader{B: t, Off: off}
 	flags := r.ReadU8()
 
-	if flags&TagNodePath != 0 {
+	if flags&TagNodeKey != 0 {
 		r.ReadUvarint()
 		return int32(r.Off)
 	}
@@ -412,13 +469,15 @@ func readNodeKeyOff(t []byte, off int) int32 {
 
 func ReadNode(t []byte, off int) Node {
 	n := Node{
-		Off: int32(off),
+		Off:      int32(off),
+		OffIsAbs: true,
 	}
 
 	r := ProtoReader{B: t, Off: off}
 	flags := r.ReadU8()
+	n.Flags = flags
 
-	if flags&TagNodePath != 0 {
+	if flags&TagNodeKey != 0 {
 		n.KeyLen = int32(r.ReadUvarint())
 		n.KeyOff = int32(r.Off)
 		r.Skip(int(n.KeyLen))
@@ -493,73 +552,153 @@ func (r *ChildReader) Next() (int, int) {
 	return ch, ptr
 }
 
-func mergeTwoNodeChild(slots [][]byte, n0, n1 Node, ni int, tw *TreeWriter) {
-	cr0 := InitChildReader(slots[0], int(n0.ChildStart))
-	cr1 := InitChildReader(slots[0], int(n1.ChildStart))
+func (r *ChildReader) Find(findch byte) int {
+	// TODO: binary search
+	for {
+		ch, ptr := r.Next()
+		if ch == -1 {
+			return -1
+		}
+		if ch == int(findch) {
+			return ptr
+		}
+	}
+}
 
+type mergeReader interface {
+	End() bool
+	Peek() (int, Node)
+	Next()
+}
+
+type mergeChildReader struct {
+	cr    ChildReader
+	slots [][]byte
+}
+
+func (mr *mergeChildReader) End() bool {
+	return mr.cr.End()
+}
+
+func (mr *mergeChildReader) Peek() (int, Node) {
+	ch, ptr := mr.cr.Peek()
+	n := ReadNode(mr.slots[0], ptr)
+	return ch, Node{
+		Off:      n.Off,
+		OffIsAbs: true,
+		KeyOff:   n.KeyOff,
+		KeyLen:   n.KeyLen,
+	}
+}
+
+func (mr *mergeChildReader) Next() {
+	mr.cr.Next()
+}
+
+func newMergeChildReader(slots [][]byte, n Node) *mergeChildReader {
+	return &mergeChildReader{
+		slots: slots,
+		cr:    InitChildReader(slots[0], int(n.ChildStart)),
+	}
+}
+
+type mergeSingleNodeReader struct {
+	slots [][]byte
+	n     Node
+	end   bool
+}
+
+func (mr *mergeSingleNodeReader) End() bool {
+	return mr.end
+}
+
+func (mr *mergeSingleNodeReader) Peek() (int, Node) {
+	key := mr.n.Key(mr.slots)
+	return int(key[0]), mr.n
+}
+
+func (mr *mergeSingleNodeReader) Next() {
+	mr.end = true
+}
+
+func mergeChildren(slots [][]byte, cr0, cr1 mergeReader, tw *TreeWriter) {
 	for {
 		if cr0.End() && cr1.End() {
 			break
 		} else if !cr0.End() && !cr1.End() {
-			ch0, ptr0 := cr0.Peek()
-			ch1, ptr1 := cr1.Peek()
-			if debugMergeTree {
-				fmt.Println(" merge child", "ch0", chstr(ch0), "ch1", chstr(ch1), "ptr0", ptr0, "ptr1", ptr1)
-			}
+			ch0, n0 := cr0.Peek()
+			ch1, n1 := cr1.Peek()
 			if ch0 < ch1 {
-				tw.Nodes = append(tw.Nodes, Node{
-					Off1:   int32(ptr0),
-					KeyOff: readNodeKeyOff(slots[0], ptr0),
-				})
+				if debugMergeTree {
+					fmt.Println(" merge child ch0", chstr(ch0), "off0", n0.Off)
+				}
+				tw.Nodes = append(tw.Nodes, n0)
 				cr0.Next()
 			} else if ch0 == ch1 {
-				tw.Nodes = append(tw.Nodes, Node{
-					Off:  int32(ptr0),
-					Off1: int32(ptr1),
-				})
+				if debugMergeTree {
+					fmt.Println(" merge child ch0", chstr(ch0), "off0", n0.Off, "ch1", chstr(ch1), "off1", n1.Off)
+				}
+				tw.Nodes = append(tw.Nodes, FromMergeNode(MergeNode{
+					Off0:    n0.Off,
+					KeyOff0: n0.KeyOff,
+					KeyLen0: n0.KeyLen,
+					Off1:    n1.Off,
+					KeyOff1: n1.KeyOff,
+					KeyLen1: n1.KeyLen,
+				}))
 				cr0.Next()
 				cr1.Next()
 			} else {
-				tw.Nodes = append(tw.Nodes, Node{
-					Off1:   int32(ptr1),
-					KeyOff: readNodeKeyOff(slots[0], ptr1),
-				})
+				if debugMergeTree {
+					fmt.Println(" merge child ch1", chstr(ch1), "off1", n1.Off)
+				}
+				tw.Nodes = append(tw.Nodes, n1)
 				cr1.Next()
 			}
 		} else if !cr0.End() {
-			ch0, ptr0 := cr0.Peek()
+			ch0, n0 := cr0.Peek()
 			if debugMergeTree {
-				fmt.Println(" merge child", "ch0", chstr(ch0), "ptr0", ptr0)
+				fmt.Println(" merge child ch0", chstr(ch0), "off0", n0.Off)
 			}
-			tw.Nodes = append(tw.Nodes, Node{
-				Off1:   int32(ptr0),
-				KeyOff: readNodeKeyOff(slots[0], ptr0),
-			})
+			tw.Nodes = append(tw.Nodes, n0)
 			cr0.Next()
 		} else {
-			ch1, ptr1 := cr1.Peek()
+			ch1, n1 := cr1.Peek()
 			if debugMergeTree {
-				fmt.Println(" merge child", "ch1", chstr(ch1), "ptr1", ptr1)
+				fmt.Println(" merge child ch1", chstr(ch1), "off1", n1.Off)
 			}
-			tw.Nodes = append(tw.Nodes, Node{
-				Off1:   int32(ptr1),
-				KeyOff: readNodeKeyOff(slots[0], ptr1),
-			})
+			tw.Nodes = append(tw.Nodes, n1)
 			cr1.Next()
 		}
 	}
 }
 
-func chstr(ch int) string {
-	if ch == -1 {
-		return "-1"
-	}
-	return string([]byte{byte(ch)})
+func nodeCopyValue(dst *Node, src Node) {
+	dst.Flags |= TagNodeValue
+	dst.ValueOp = src.ValueOp
+	dst.ValueSlot = src.ValueSlot
+	dst.ValueOff = src.ValueOff
+	dst.ValueLen = src.ValueLen
 }
 
-func mergeTwoNode(slots [][]byte, n0, n1 Node, ni int, tw *TreeWriter) {
+func newMergeReader(slots [][]byte, ch int, n Node, ki int) mergeReader {
+	if ch == -1 {
+		return newMergeChildReader(slots, n)
+	} else {
+		refn := Node{
+			Flags:  TagNodeKey | TagNodeRef,
+			Off:    n.Off,
+			RefOff: n.Off,
+			KeyOff: n.KeyOff + int32(ki),
+			KeyLen: n.KeyLen - int32(ki),
+		}
+		return &mergeSingleNodeReader{slots: slots, n: refn}
+	}
+}
+
+func mergeTwo(slots [][]byte, n0, n1 Node, tw *TreeWriter) Node {
 	if debugMergeTree {
-		fmt.Println("merge node", n0.Off, n1.Off, "keyoff", n0.KeyOff, n1.KeyOff, "keylen", n0.KeyLen, n1.KeyLen)
+		fmt.Println("merge two", "n0", n0.Off, "key0", string(n0.Key(slots)), "n1", n1.Off, "key1", string(n1.Key(slots)))
 	}
 
 	ki := 0
@@ -577,191 +716,167 @@ func mergeTwoNode(slots [][]byte, n0, n1 Node, ni int, tw *TreeWriter) {
 		}
 
 		if debugMergeTree {
-			fmt.Println(" ki", ki, "ch0", chstr(ch0), "ch1", chstr(ch1))
+			fmt.Println(" ch0", chstr(ch0), "ch1", chstr(ch1))
 		}
 
-		if ch0 == -1 && ch1 == -1 {
-			// both end
-			// use n1's value
-			if debugMergeTree {
-				fmt.Println(" both end")
-			}
-			tw.Nodes[ni] = Node{
+		if ch0 == -1 || ch1 == -1 || ch0 != ch1 {
+			n := Node{
+				Flags:      TagNodeKey | TagNodeChild,
 				KeyOff:     n0.KeyOff,
 				KeyLen:     int32(ki),
 				ChildStart: int32(len(tw.Nodes)),
-				ValueOp:    n1.ValueOp,
-				ValueSlot:  n1.ValueSlot,
-				ValueOff:   n1.ValueOff,
-				ValueLen:   n1.ValueLen,
 			}
-			// merge both child next
-			mergeTwoNodeChild(slots, n0, n1, ni, tw)
-			tw.Nodes[ni].ChildNr = int32(len(tw.Nodes) - int(tw.Nodes[ni].ChildStart))
-			return
-
-		} else if ch0 != -1 && ch1 != -1 {
-			if ch0 != ch1 {
-				// both not end
-				// child is n0,n1
-				if debugMergeTree {
-					fmt.Println(" both not end")
+			cr0 := newMergeReader(slots, ch0, n0, ki)
+			cr1 := newMergeReader(slots, ch1, n1, ki)
+			mergeChildren(slots, cr0, cr1, tw)
+			n.ChildNr = int32(len(tw.Nodes)) - n.ChildStart
+			if ch0 == -1 {
+				if n0.Flags&TagNodeValue != 0 {
+					nodeCopyValue(&n, n0)
 				}
-				tw.Nodes[ni] = Node{
-					KeyOff:     n0.KeyOff,
-					KeyLen:     int32(ki),
-					ChildStart: int32(len(tw.Nodes)),
-					ChildNr:    2,
+			}
+			if ch1 == -1 {
+				if n1.Flags&TagNodeValue != 0 {
+					nodeCopyValue(&n, n1)
 				}
-				tw.Nodes = append(tw.Nodes, Node{
-					KeyOff: n0.KeyOff + int32(ki),
-					KeyLen: n0.KeyLen - int32(ki),
-					RefOff: n0.Off,
-				})
-				tw.Nodes = append(tw.Nodes, Node{
-					KeyOff: n1.KeyOff + int32(ki),
-					KeyLen: n1.KeyLen - int32(ki),
-					RefOff: n1.Off,
-				})
-				return
-
-			} else {
-				// continue
 			}
-		} else if ch0 != -1 {
-			// only n0 end
-			// use n0's value, child is n1
 			if debugMergeTree {
-				fmt.Println(" only n0 end")
+				fmt.Println(" copy value")
 			}
-			tw.Nodes[ni] = Node{
-				KeyOff:     n0.KeyOff,
-				KeyLen:     int32(ki),
-				ChildStart: int32(len(tw.Nodes)),
-				ChildNr:    1,
-				ValueOp:    n0.ValueOp,
-				ValueSlot:  n0.ValueSlot,
-				ValueOff:   n0.ValueOff,
-				ValueLen:   n0.ValueLen,
-			}
-			tw.Nodes = append(tw.Nodes, Node{
-				KeyOff: n1.KeyOff + int32(ki),
-				KeyLen: n1.KeyLen - int32(ki),
-				RefOff: n1.Off,
-			})
-			return
-
-		} else if ch1 != -1 {
-			// only n1 end
-			// use n1's value, child is n0
-			if debugMergeTree {
-				fmt.Println(" only n1 end")
-			}
-			tw.Nodes[ni] = Node{
-				KeyOff:     n0.KeyOff,
-				KeyLen:     int32(ki),
-				ChildStart: int32(len(tw.Nodes)),
-				ChildNr:    1,
-				ValueOp:    n1.ValueOp,
-				ValueSlot:  n1.ValueSlot,
-				ValueOff:   n1.ValueOff,
-				ValueLen:   n1.ValueLen,
-			}
-			tw.Nodes = append(tw.Nodes, Node{
-				KeyOff: n0.KeyOff + int32(ki),
-				KeyLen: n0.KeyLen - int32(ki),
-				RefOff: n0.Off,
-			})
-			return
-
+			return n
 		}
 		ki++
 	}
 }
 
-func MergeTree(slots [][]byte, tree0, tree1 int, tw *TreeWriter, w *SnapshotRewriter) {
+func MergeTree(slots [][]byte, tree0, tree1 int, tw *TreeWriter) {
 	t := slots[0]
 
 	tw.Nodes = tw.Nodes[:0]
-
-	tw.Nodes = append(tw.Nodes, Node{
-		Off:  int32(tree0),
+	tw.Nodes = append(tw.Nodes, FromMergeNode(MergeNode{
+		Off0: int32(tree0),
 		Off1: int32(tree1),
-	})
+	}))
 
 	for ni := 0; ni < len(tw.Nodes); ni++ {
 		n := tw.Nodes[ni]
 
-		if n.Off == 0 && n.Off1 == 0 {
-			// ref
-		} else if n.Off != 0 && n.Off1 != 0 {
-			// merge two
-			n0 := ReadNode(t, int(n.Off))
-			n1 := ReadNode(t, int(n.Off1))
-			mergeTwoNode(slots, n0, n1, ni, tw)
-		} else {
-			// only off
+		if n.Flags&tagNodeMerge != 0 {
+			m := ToMergeNode(n)
+			n0 := ReadNode(t, int(m.Off0))
+			n1 := ReadNode(t, int(m.Off1))
+			tw.Nodes[ni] = mergeTwo(slots, n0, n1, tw)
 		}
 	}
 }
+
+// type TreeBfs struct {
+// }
+
+// func (s *TreeBfs) Search(slots [][]byte, off int, tw *TreeWriter) {
+// 	t := slots[0]
+// 	n := ReadNode(t, off)
+
+// 	if n.KeyOff != 0 {
+
+// 	}
+
+// 	cr := InitChildReader(t, int(n.ChildStart))
+// 	for {
+// 		ch, ptr := cr.Next()
+// 		if ch == -1 {
+// 			break
+// 		}
+// 	}
+// }
 
 type TreeDfs struct {
 	kb Buffer
 }
 
-type TreeDfsFunc func(k []byte, op int, value []byte) bool
-
-func (d *TreeDfs) search(slots [][]byte, off int, fn TreeDfsFunc) {
+func Get(slots [][]byte, off int, k []byte) (bool, []byte) {
 	t := slots[0]
 	n := ReadNode(t, off)
-
-	if n.KeyOff != 0 {
-		key := slots[0][int(n.KeyOff):int(n.KeyOff+n.KeyLen)]
-		d.kb.Write(key)
-		defer d.kb.Back(len(key))
-	}
-
-	var value []byte
-	if n.ValueOp == OpSet {
-		value = slots[n.ValueSlot][int(n.ValueOff):int(n.ValueOff+n.ValueLen)]
-	}
-
-	if fn(d.kb.Bytes(), int(n.ValueOp), value) {
-		return
-	}
-
-	cr := InitChildReader(t, int(n.ChildStart))
-	for {
-		ch, off := cr.Next()
-		if ch == -1 {
-			break
+	ki := 0
+	for ki < len(k) {
+		if n.KeyLen > 0 {
+			if t[n.KeyOff] == k[ki] {
+				ki++
+				n.KeyOff++
+				n.KeyLen--
+				continue
+			} else {
+				return false, nil
+			}
+		} else {
+			if n.ValueOp == OpSet {
+				value := slots[n.ValueSlot][int(n.ValueOff):int(n.ValueOff+n.ValueLen)]
+				return true, value
+			} else {
+				cr := InitChildReader(t, int(n.ChildStart))
+				ptr := cr.Find(k[ki])
+				if ptr == -1 {
+					return false, nil
+				}
+				n = ReadNode(t, ptr)
+			}
 		}
-		d.search(slots, off, fn)
 	}
+	return false, nil
 }
 
-func (d *TreeDfs) Search(slots [][]byte, off int, fn TreeDfsFunc) {
-	d.search(slots, off, fn)
+type rangeDfs struct {
+	slots  [][]byte
+	prefix []byte
+	fn     func(k, v []byte)
+	n      Node
+}
+
+func (d *rangeDfs) search() {
+	key := d.n.Key(d.slots)
+	d.prefix = append(d.prefix, key...)
+	if d.n.ValueOp == OpSet {
+		d.fn(d.prefix, d.n.Value(d.slots))
+	}
+	cr := InitChildReader(d.slots[0], int(d.n.ChildStart))
+	for !cr.End() {
+		_, ptr := cr.Next()
+		d.n = ReadNode(d.slots[0], ptr)
+		d.search()
+	}
+	d.prefix = d.prefix[:len(d.prefix)-len(key)]
 }
 
 func Range(slots [][]byte, off int, prefix []byte, fn func(k, v []byte)) {
-	d := &TreeDfs{}
-	d.Search(slots, off, func(k []byte, op int, value []byte) bool {
-		if len(k) < len(prefix) {
-			return bytes.Compare(k, prefix[:len(k)]) != 0
+	t := slots[0]
+	n := ReadNode(t, off)
+	pi := 0
+	for pi < len(prefix) {
+		if n.KeyLen > 0 {
+			if t[n.KeyOff] == prefix[pi] {
+				pi++
+				n.KeyOff++
+				n.KeyLen--
+				continue
+			} else {
+				return
+			}
 		} else {
-			if bytes.Compare(k[:len(prefix)], prefix) != 0 {
-				return true
+			cr := InitChildReader(t, int(n.ChildStart))
+			ptr := cr.Find(prefix[pi])
+			if ptr == -1 {
+				return
 			}
-			if op == OpSet {
-				fn(k, value)
-			}
-			return false
+			n = ReadNode(t, ptr)
 		}
-	})
-}
-
-func Get(slots [][]byte, off int) (bool, []byte) {
+	}
+	d := rangeDfs{
+		slots:  slots,
+		prefix: prefix,
+		fn:     fn,
+		n:      n,
+	}
+	d.search()
 }
 
 func debugPrintDepth(depth int) {
@@ -788,11 +903,8 @@ func debugDfsTree(slots [][]byte, off int, depth int) {
 
 	if n.ChildStart != 0 {
 		cr := InitChildReader(slots[0], int(n.ChildStart))
-		for {
+		for !cr.End() {
 			ch, ptr := cr.Next()
-			if ch == -1 {
-				break
-			}
 			debugPrintDepth(depth)
 			fmt.Println("index", "ch", chstr(int(ch)), "ptr", ptr)
 			debugDfsTree(slots, ptr, depth+1)
@@ -803,14 +915,6 @@ func debugDfsTree(slots [][]byte, off int, depth int) {
 func DebugDfsTree(slots [][]byte, off int) {
 	fmt.Println("dfs")
 	debugDfsTree(slots, off, 0)
-}
-
-func DebugDfsTree2(slots [][]byte, off int) {
-	d := &TreeDfs{}
-	d.Search(slots, off, func(k []byte, op int, value []byte) bool {
-		fmt.Println("k", string(k), "op", op, "value", string(value))
-		return false
-	})
 }
 
 var DefaultValueSlotSize = 1024 * 128
@@ -835,9 +939,7 @@ func NewSnapshotRewriter(origslots [][]byte) *SnapshotRewriter {
 	}
 	w.Slots[0] = make([]byte, DefaultTreeSlotSize)
 	w.Slots[1] = make([]byte, DefaultValueSlotSize)
-	w.Sizes[0] = 1
-	w.Sizes[1] = 1
-	w.Slot0Size = 1
+	w.Slot0Size = 0
 	return w
 }
 
@@ -940,7 +1042,7 @@ func (d *Delta) notifyAll() {
 func (d *Delta) RequestSubscribe(c *bufio.ReadWriter) {
 }
 
-type Commit struct {
+type CommitWriter struct {
 	Slots  [][]byte
 	bkey   Buffer
 	bvalue Buffer
@@ -948,7 +1050,7 @@ type Commit struct {
 	Oplog  Node
 }
 
-func (c *Commit) Reset() {
+func (c *CommitWriter) Reset() {
 	for i := range c.Slots {
 		c.Slots[i] = nil
 	}
@@ -958,19 +1060,19 @@ func (c *Commit) Reset() {
 	c.Oplogs = c.Oplogs[:0]
 }
 
-func (c *Commit) Start() {
+func (c *CommitWriter) Start() {
 	c.Slots = append(c.Slots, nil)
 	c.Slots = append(c.Slots, nil)
 	c.bkey.NextBytes(1)
 	c.bvalue.NextBytes(1)
 }
 
-func (c *Commit) End() {
+func (c *CommitWriter) End() {
 	c.Slots[0] = c.bkey.Bytes()
 	c.Slots[1] = c.bvalue.Bytes()
 }
 
-func (c *Commit) AddOplogSet(k, v []byte) {
+func (c *CommitWriter) WriteOplogSet(k, v []byte) {
 	c.StartOplog()
 	copy(c.NextKey(len(k)), k)
 	copy(c.NextValue(len(v)), v)
@@ -978,27 +1080,27 @@ func (c *Commit) AddOplogSet(k, v []byte) {
 	c.EndOplog()
 }
 
-func (c *Commit) AddOplogRemove(k []byte) {
+func (c *CommitWriter) WriteOplogRemove(k []byte) {
 	c.StartOplog()
 	copy(c.NextKey(len(k)), k)
 	c.Oplog.ValueOp = OpRemove
 	c.EndOplog()
 }
 
-func (c *Commit) StartOplog() {
+func (c *CommitWriter) StartOplog() {
 	c.Oplog = Node{
 		Off: int32(len(c.Oplogs)),
 	}
 }
 
-func (c *Commit) NextKey(n int) []byte {
+func (c *CommitWriter) NextKey(n int) []byte {
 	c.Oplog.KeyOff = int32(c.bkey.Len())
 	c.Oplog.KeyLen = int32(n)
 	key := c.bkey.NextBytes(n)
 	return key
 }
 
-func (c *Commit) NextValue(n int) []byte {
+func (c *CommitWriter) NextValue(n int) []byte {
 	var b []byte
 	if n < 1024*32 {
 		c.Oplog.ValueSlot = 1
@@ -1015,14 +1117,14 @@ func (c *Commit) NextValue(n int) []byte {
 	return b
 }
 
-func (c *Commit) EndOplog() {
+func (c *CommitWriter) EndOplog() {
 	c.Oplogs = append(c.Oplogs, c.Oplog)
 }
 
 type deltaPublish struct {
 	d  *Delta
 	rw *bufio.ReadWriter
-	c  Commit
+	c  CommitWriter
 }
 
 func (p *deltaPublish) handleCommitOplog() error {
