@@ -152,47 +152,6 @@ type Node struct {
 	ValueLen   int32
 }
 
-type MergeNode struct {
-	Off0    int32
-	Off1    int32
-	KeyOff0 int32
-	KeyOff1 int32
-	KeyLen0 int32
-	KeyLen1 int32
-}
-
-func FromMergeNode(n MergeNode) Node {
-	return Node{
-		Flags:      tagNodeMerge,
-		Off:        n.Off0,
-		ChildStart: n.Off1,
-		ChildNr:    n.KeyOff0,
-		RefOff:     n.KeyOff1,
-		KeyOff:     n.KeyLen0,
-		KeyLen:     n.KeyLen1,
-	}
-}
-
-func ToMergeNode(n Node) MergeNode {
-	return MergeNode{
-		Off0:    n.Off,
-		Off1:    n.ChildStart,
-		KeyOff0: n.ChildNr,
-		KeyOff1: n.RefOff,
-		KeyLen0: n.KeyOff,
-		KeyLen1: n.KeyLen,
-	}
-}
-
-type OplogNode struct {
-	OplogStart int32
-	OplogNr    int32
-	LevelStart int32
-	LevelLen   int32
-	KeyOff     int32
-	KeyLen     int32
-}
-
 func (n Node) Value(slots [][]byte) []byte {
 	return slots[int(n.ValueSlot)][int(n.ValueOff):int(n.ValueOff+n.ValueLen)]
 }
@@ -201,14 +160,8 @@ func (n Node) Key(slots [][]byte) []byte {
 	return slots[0][int(n.KeyOff):int(n.KeyOff+n.KeyLen)]
 }
 
-type TreeWriter struct {
-	Nodes []Node
-	treeb Buffer
-}
-
 func oplogKey(slots [][]byte, o Node) []byte {
-	keys := slots[0]
-	return keys[int(o.KeyOff):int(o.KeyOff+o.KeyLen)]
+	return o.Key(slots)
 }
 
 func sortOplog(slots [][]byte, oplogs []Node) {
@@ -285,11 +238,6 @@ func searchOplogs(tw *TreeWriter, slots [][]byte, oplogs []Node, ni int, oplogst
 }
 
 func BuildCommitTree(tw *TreeWriter, slots [][]byte, oplogs []Node) {
-	// ChildStart => OplogStart
-	// ChildNr => OplogNr
-	// KeyOff => LevelStart
-	// KeyLen => LevelLen
-
 	sortOplog(slots, oplogs)
 
 	tw.Nodes = tw.Nodes[:0]
@@ -330,6 +278,11 @@ func BuildCommitTree(tw *TreeWriter, slots [][]byte, oplogs []Node) {
 			n.Flags |= TagNodeKey
 		}
 	}
+}
+
+type TreeWriter struct {
+	Nodes []Node
+	treeb Buffer
 }
 
 func tryPtrsize(tw *TreeWriter, ptrsize int, n *Node) bool {
@@ -427,7 +380,7 @@ func (tw *TreeWriter) Write(w *SnapshotRewriter) int {
 				tw.treeb.WriteByte(ch)
 				off := int(c.Off)
 				if c.OffIsAbs {
-					off = -(w.Slot0Size - off)
+					off = -(w.Slot0Len - off)
 				}
 				ptr := tw.treeb.Len() - off
 				putInt(tw.treeb.NextBytes(ptrsize), ptr, ptrsize)
@@ -444,7 +397,7 @@ func (tw *TreeWriter) Write(w *SnapshotRewriter) int {
 		}
 	}
 
-	off := w.Slot0Size
+	off := w.Slot0Len
 	w.WriteTree(tw.treeb.Bytes())
 
 	if debugBuildCommitTree {
@@ -562,6 +515,38 @@ func (r *ChildReader) Find(findch byte) int {
 		if ch == int(findch) {
 			return ptr
 		}
+	}
+}
+
+type MergeNode struct {
+	Off0    int32
+	Off1    int32
+	KeyOff0 int32
+	KeyOff1 int32
+	KeyLen0 int32
+	KeyLen1 int32
+}
+
+func FromMergeNode(n MergeNode) Node {
+	return Node{
+		Flags:      tagNodeMerge,
+		Off:        n.Off0,
+		ChildStart: n.Off1,
+		ChildNr:    n.KeyOff0,
+		RefOff:     n.KeyOff1,
+		KeyOff:     n.KeyLen0,
+		KeyLen:     n.KeyLen1,
+	}
+}
+
+func ToMergeNode(n Node) MergeNode {
+	return MergeNode{
+		Off0:    n.Off,
+		Off1:    n.ChildStart,
+		KeyOff0: n.ChildNr,
+		KeyOff1: n.RefOff,
+		KeyLen0: n.KeyOff,
+		KeyLen1: n.KeyLen,
 	}
 }
 
@@ -777,10 +762,6 @@ func MergeTree(slots [][]byte, tree0, tree1 int, tw *TreeWriter) {
 // 	t := slots[0]
 // 	n := ReadNode(t, off)
 
-// 	if n.KeyOff != 0 {
-
-// 	}
-
 // 	cr := InitChildReader(t, int(n.ChildStart))
 // 	for {
 // 		ch, ptr := cr.Next()
@@ -789,10 +770,6 @@ func MergeTree(slots [][]byte, tree0, tree1 int, tw *TreeWriter) {
 // 		}
 // 	}
 // }
-
-type TreeDfs struct {
-	kb Buffer
-}
 
 func Get(slots [][]byte, off int, k []byte) (bool, []byte) {
 	t := slots[0]
@@ -847,7 +824,7 @@ func (d *rangeDfs) search() {
 	d.prefix = d.prefix[:len(d.prefix)-len(key)]
 }
 
-func Range(slots [][]byte, off int, prefix []byte, fn func(k, v []byte)) {
+func Range(slots [][]byte, off int, prefix []byte, fn func(k, v []byte)) []byte {
 	t := slots[0]
 	n := ReadNode(t, off)
 	pi := 0
@@ -859,13 +836,13 @@ func Range(slots [][]byte, off int, prefix []byte, fn func(k, v []byte)) {
 				n.KeyLen--
 				continue
 			} else {
-				return
+				return prefix
 			}
 		} else {
 			cr := InitChildReader(t, int(n.ChildStart))
 			ptr := cr.Find(prefix[pi])
 			if ptr == -1 {
-				return
+				return prefix
 			}
 			n = ReadNode(t, ptr)
 		}
@@ -877,6 +854,7 @@ func Range(slots [][]byte, off int, prefix []byte, fn func(k, v []byte)) {
 		n:      n,
 	}
 	d.search()
+	return d.prefix
 }
 
 func debugPrintDepth(depth int) {
@@ -921,25 +899,25 @@ var DefaultValueSlotSize = 1024 * 128
 var DefaultTreeSlotSize = 1024 * 128
 
 type SnapshotRewriter struct {
-	OrigSlots [][]byte
-	Slots     [][]byte
-	Sizes     []int
-	Slot0Size int
-	SizesOff  int
-	WSlot     int
-	sizesb    Buffer
+	OrigSlots   [][]byte
+	Slots       [][]byte
+	SlotsLen    []int
+	Slot0Len    int
+	SlotsLenOff int
+	WSlot       int
+	sizesb      Buffer
 }
 
 func NewSnapshotRewriter(origslots [][]byte) *SnapshotRewriter {
 	w := &SnapshotRewriter{
 		OrigSlots: origslots,
 		Slots:     make([][]byte, 2, 16),
-		Sizes:     make([]int, 2, 16),
+		SlotsLen:  make([]int, 2, 16),
 		WSlot:     1,
 	}
 	w.Slots[0] = make([]byte, DefaultTreeSlotSize)
 	w.Slots[1] = make([]byte, DefaultValueSlotSize)
-	w.Slot0Size = 0
+	w.Slot0Len = 0
 	return w
 }
 
@@ -948,13 +926,13 @@ func (w *SnapshotRewriter) reserveValue(n int) {
 		panic("too big")
 	}
 	for {
-		if w.Sizes[w.WSlot]+n <= len(w.Slots[w.WSlot]) {
+		if w.SlotsLen[w.WSlot]+n <= len(w.Slots[w.WSlot]) {
 			return
 		}
 		w.WSlot++
 		if w.WSlot == len(w.Slots) {
 			w.Slots = append(w.Slots, make([]byte, DefaultValueSlotSize))
-			w.Sizes = append(w.Sizes, 0)
+			w.SlotsLen = append(w.SlotsLen, 0)
 		}
 	}
 }
@@ -966,14 +944,14 @@ func (w *SnapshotRewriter) newSlots() {
 }
 
 func (w *SnapshotRewriter) WriteTree(b []byte) {
-	if n := int(w.Slot0Size) + len(b); n > len(w.Slots[0]) {
+	if n := int(w.Slot0Len) + len(b); n > len(w.Slots[0]) {
 		w.newSlots()
 		newslot0 := make([]byte, n*2)
 		copy(newslot0, w.Slots[0])
 		w.Slots[0] = newslot0
 	}
-	copy(w.Slots[0][int(w.Slot0Size):], b)
-	w.Slot0Size += len(b)
+	copy(w.Slots[0][int(w.Slot0Len):], b)
+	w.Slot0Len += len(b)
 }
 
 func (w *SnapshotRewriter) WriteValue(slot, off, size int) (int, int) {
@@ -984,41 +962,41 @@ func (w *SnapshotRewriter) WriteValue(slot, off, size int) (int, int) {
 		}
 		w.reserveValue(len(b))
 		slot := w.WSlot
-		off := w.Sizes[w.WSlot]
-		w.Sizes[w.WSlot] += len(b)
+		off := w.SlotsLen[w.WSlot]
+		w.SlotsLen[w.WSlot] += len(b)
 		copy(w.Slots[slot][off:], b)
 		return slot, off
 	} else {
 		slot := len(w.Slots)
 		off := 0
 		w.Slots = append(w.Slots, b)
-		w.Sizes = append(w.Sizes, len(b))
+		w.SlotsLen = append(w.SlotsLen, len(b))
 		return slot, off
 	}
 }
 
 func (w *SnapshotRewriter) Finish() *Snapshot {
-	w.SizesOff = w.Slot0Size
+	w.SlotsLenOff = w.Slot0Len
 	w.sizesb.Reset()
-	writeUvarint(&w.sizesb, len(w.Sizes))
-	for _, v := range w.Sizes {
+	writeUvarint(&w.sizesb, len(w.SlotsLen))
+	for _, v := range w.SlotsLen {
 		writeUvarint(&w.sizesb, v)
 	}
 	w.WriteTree(w.sizesb.Bytes())
 	return &Snapshot{
-		Slots:     w.Slots,
-		Slot0Size: int(w.Slot0Size),
-		SizesOff:  int(w.SizesOff),
+		Slots:       w.Slots,
+		Slot0Len:    int(w.Slot0Len),
+		SlotsLenOff: int(w.SlotsLenOff),
 	}
 }
 
 type Snapshot struct {
-	Slots     [][]byte
-	Slot0Size int
-	SizesOff  int
-	WSlot     int
-	Head      int
-	Version   int
+	Slots       [][]byte
+	Slot0Len    int
+	WSlot       int
+	SlotsLenOff int
+	HistoryOff  int
+	Version     int
 }
 
 type Delta struct {
@@ -1063,8 +1041,6 @@ func (c *CommitWriter) Reset() {
 func (c *CommitWriter) Start() {
 	c.Slots = append(c.Slots, nil)
 	c.Slots = append(c.Slots, nil)
-	c.bkey.NextBytes(1)
-	c.bvalue.NextBytes(1)
 }
 
 func (c *CommitWriter) End() {
@@ -1220,68 +1196,3 @@ func (d *Delta) HandlePublish(rw io.ReadWriter) error {
 	}
 	return p.handle()
 }
-
-// func writeFull(c io.Writer, h *Head) error {
-// 	return nil
-// }
-
-// func (d *Delta) HandleSubscribe(c *bufio.ReadWriter) error {
-// 	notify, remove := d.Subscribe()
-// 	defer remove()
-
-// 	ver, err := binary.ReadVarint(c)
-// 	if err != nil {
-// 		return err
-// 	}
-
-// 	h := d.Head()
-
-// 	if h.LatestThan(ver) {
-// 		if h.CanDiff(ver) {
-// 			err := h.Diff(ver, func(op int, k, v []byte) error {
-// 				// return writeDelta(c, op, k, v)
-// 				return nil
-// 			})
-// 			if err != nil {
-// 				return err
-// 			}
-// 		} else {
-// 			if err := writeFull(c, h); err != nil {
-// 				return err
-// 			}
-// 		}
-// 	}
-
-// 	for {
-// 		select {
-// 		case <-notify:
-// 		}
-// 	}
-// }
-
-// func allocInts(psrc *[]int, n int) []int {
-// 	src := *psrc
-// 	start := len(src)
-// 	end := len(src) + n
-// 	if end < cap(src) {
-// 		src = src[:end]
-// 	} else {
-// 		new := make([]int, end, end*2)
-// 		copy(new, src)
-// 		src = new
-// 	}
-// 	*psrc = src
-// 	b := src[start:end]
-// 	return b
-// }
-
-// func ProtoReadNoPanic(fn func()) error {
-// 	if err := recover(); err != nil {
-// 		if err == ErrProtoRead {
-// 			return ErrProtoRead
-// 		}
-// 		panic(err)
-// 	}
-// 	fn()
-// 	return nil
-// }
