@@ -7,7 +7,7 @@ import (
 )
 
 func main() {
-	sw := delta.NewSnapshotWriter()
+	sw := delta.NewSnapshotWriter(0)
 	tw := &delta.TreeWriter{}
 	trees := []int{}
 
@@ -47,8 +47,7 @@ func main() {
 	}
 
 	{
-		delta.MergeTree(sw.Slots, trees[0], trees[1], tw)
-		h := tw.Write(sw.Slots, sw)
+		h := delta.MergeTree(sw.Slots, trees[0], trees[1], nil, tw, sw)
 		trees = append(trees, h)
 	}
 
