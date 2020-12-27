@@ -296,7 +296,7 @@ func tryPtrsize(tw *TreeWriter, ptrsize int, n *Node) bool {
 	return true
 }
 
-func (tw *TreeWriter) Write(w *SnapshotRewriter) int {
+func (tw *TreeWriter) Write(w *SnapshotWriter) int {
 	if debugBuildCommitTree {
 		fmt.Println("write")
 	}
@@ -1003,21 +1003,19 @@ func ReadSlotsLen(slots [][]byte, off int) []int {
 var DefaultValueSlotSize = 1024 * 128
 var DefaultTreeSlotSize = 1024 * 128
 
-type SnapshotRewriter struct {
-	OrigSlots [][]byte
-	Slots     [][]byte
-	SlotsLen  []int
-	Slot0Len  int
-	WSlot     int
-	b         Buffer
+type SnapshotWriter struct {
+	Slots    [][]byte
+	SlotsLen []int
+	Slot0Len int
+	WSlot    int
+	b        Buffer
 }
 
-func NewSnapshotRewriter(origslots [][]byte) *SnapshotRewriter {
-	w := &SnapshotRewriter{
-		OrigSlots: origslots,
-		Slots:     make([][]byte, 2, 16),
-		SlotsLen:  make([]int, 2, 16),
-		WSlot:     1,
+func NewSnapshotWriter() *SnapshotWriter {
+	w := &SnapshotWriter{
+		Slots:    make([][]byte, 2, 16),
+		SlotsLen: make([]int, 2, 16),
+		WSlot:    1,
 	}
 	w.Slots[0] = make([]byte, DefaultTreeSlotSize)
 	w.Slots[1] = make([]byte, DefaultValueSlotSize)
@@ -1025,7 +1023,7 @@ func NewSnapshotRewriter(origslots [][]byte) *SnapshotRewriter {
 	return w
 }
 
-func (w *SnapshotRewriter) reserveValue(n int) {
+func (w *SnapshotWriter) reserveValue(n int) {
 	if n > DefaultValueSlotSize {
 		panic("too big")
 	}
@@ -1041,13 +1039,13 @@ func (w *SnapshotRewriter) reserveValue(n int) {
 	}
 }
 
-func (w *SnapshotRewriter) newSlots() {
+func (w *SnapshotWriter) newSlots() {
 	newslots := make([][]byte, len(w.Slots), cap(w.Slots))
 	copy(newslots, w.Slots)
 	w.Slots = newslots
 }
 
-func (w *SnapshotRewriter) WriteTree(b []byte) {
+func (w *SnapshotWriter) WriteTree(b []byte) {
 	if n := int(w.Slot0Len) + len(b); n > len(w.Slots[0]) {
 		w.newSlots()
 		newslot0 := make([]byte, n*2)
@@ -1058,12 +1056,8 @@ func (w *SnapshotRewriter) WriteTree(b []byte) {
 	w.Slot0Len += len(b)
 }
 
-func (w *SnapshotRewriter) WriteValue(slot, off, size int) (int, int) {
-	b := w.OrigSlots[slot][off : off+size]
-	if slot > 1 {
-		if len(b) > DefaultValueSlotSize {
-			panic("too big")
-		}
+func (w *SnapshotWriter) WriteValue(b []byte) (int, int) {
+	if len(b) < DefaultValueSlotSize {
 		w.reserveValue(len(b))
 		slot := w.WSlot
 		off := w.SlotsLen[w.WSlot]
@@ -1079,7 +1073,7 @@ func (w *SnapshotRewriter) WriteValue(slot, off, size int) (int, int) {
 	}
 }
 
-func (w *SnapshotRewriter) WriteSlotsLen() int {
+func (w *SnapshotWriter) WriteSlotsLen() int {
 	off := w.Slot0Len
 	w.b.Reset()
 	writeUvarint(&w.b, len(w.SlotsLen))
@@ -1123,17 +1117,15 @@ func (d *Delta) RequestSubscribe(c *bufio.ReadWriter) {
 type DiffTreeWriter struct {
 	Slots  [][]byte
 	bkey   Buffer
-	bvalue Buffer
 	Oplogs []Node
 	Oplog  Node
 }
 
-func (c *DiffTreeWriter) Reset() {
+func (c *DiffTreeWriter) Reset(sw *SnapshotWriter) {
 	for i := range c.Slots {
 		c.Slots[i] = nil
 	}
 	c.bkey.Reset()
-	c.bvalue.Reset()
 	c.Slots = c.Slots[:0]
 	c.Oplogs = c.Oplogs[:0]
 }
@@ -1145,7 +1137,6 @@ func (c *DiffTreeWriter) Start() {
 
 func (c *DiffTreeWriter) End() {
 	c.Slots[0] = c.bkey.Bytes()
-	c.Slots[1] = c.bvalue.Bytes()
 }
 
 func (c *DiffTreeWriter) WriteOplogSet(k, v []byte) {

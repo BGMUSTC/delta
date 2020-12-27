@@ -14,7 +14,7 @@ func main() {
 		c.WriteOplogSet([]byte(s), []byte(s))
 	}
 
-	sw := delta.NewSnapshotRewriter(nil)
+	sw := delta.NewSnapshotWriter(nil)
 
 	if true {
 		c := &delta.DiffTreeWriter{}
