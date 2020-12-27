@@ -25,7 +25,8 @@ const (
 	TagNodeValue
 	TagNodeRef
 	TagNodeChild
-	tagNodeMerge // inner use
+	tagNodeMerge      // inner use
+	tagNodeCheckValid // inner use
 )
 
 const (
@@ -50,6 +51,7 @@ const (
 const (
 	debugBuildCommitTree = false
 	debugMergeTree       = false
+	debugCompact         = false
 )
 
 var ErrProtoRead = fmt.Errorf("proto read failed")
@@ -159,6 +161,7 @@ type Node struct {
 	ValueSlot  int32
 	ValueOff   int32
 	ValueLen   int32
+	ValidNr    int32
 }
 
 func (n Node) Value(slots [][]byte) []byte {
@@ -246,6 +249,12 @@ func searchOplogs(tw *TreeWriter, slots [][]byte, oplogs []Node, ni int, oplogst
 	return false
 }
 
+var emptyTree = []byte{0}
+
+func WriteEmptyTree(sw *SnapshotWriter) int {
+	return sw.WriteTree(emptyTree)
+}
+
 func BuildCommitTree(tw *TreeWriter, slots [][]byte, oplogs []Node) {
 	sortOplog(slots, oplogs)
 
@@ -298,6 +307,9 @@ func tryPtrsize(tw *TreeWriter, ptrsize int, n *Node) bool {
 	off := int32(tw.treeb.Len()) + 2
 	for ci := n.ChildStart; ci < n.ChildStart+int32(n.ChildNr); ci++ {
 		c := tw.Nodes[ci]
+		if n.Flags&tagNodeCheckValid != 0 && n.ValidNr == 0 {
+			continue
+		}
 		off++
 		ptr := off - c.Off
 		if uvarintSize(int(ptr)) > ptrsize {
@@ -323,6 +335,7 @@ func (tw *TreeWriter) Write(slots [][]byte, w *SnapshotWriter) int {
 		}
 
 		n.Off = int32(tw.treeb.Len())
+		n.OffIsAbs = false
 
 		if debugBuildCommitTree {
 			fmt.Println("node", ni, "off", n.Off, "keyoff", n.KeyOff, "keylen", n.KeyLen, "childstart", n.ChildStart, "childnr", n.ChildNr)
@@ -362,7 +375,7 @@ func (tw *TreeWriter) Write(slots [][]byte, w *SnapshotWriter) int {
 				writeUvarint(&tw.treeb, int(n.ValueLen))  // size
 				if debugBuildCommitTree {
 					value := n.Value(w.Slots)
-					fmt.Println(" value", string(value))
+					fmt.Println(" value", value, "off", "slot", "len", n.ValueOff, n.ValueSlot, n.ValueLen)
 				}
 			}
 		}
@@ -380,10 +393,15 @@ func (tw *TreeWriter) Write(slots [][]byte, w *SnapshotWriter) int {
 			}
 
 			tw.treeb.WriteByte(byte(ptrsize))
-			tw.treeb.WriteByte(byte(n.ChildNr - 1))
+			childnroff := tw.treeb.Len()
+			tw.treeb.WriteByte(0)
+			childnr := 0
 
 			for ci := n.ChildStart; ci < n.ChildStart+int32(n.ChildNr); ci++ {
 				c := tw.Nodes[ci]
+				if n.Flags&tagNodeCheckValid != 0 && c.ValidNr == 0 {
+					continue
+				}
 				ch := slots[0][int(c.KeyOff)]
 				tw.treeb.WriteByte(ch)
 				off := int(c.Off)
@@ -393,9 +411,12 @@ func (tw *TreeWriter) Write(slots [][]byte, w *SnapshotWriter) int {
 				ptr := tw.treeb.Len() - off
 				putInt(tw.treeb.NextBytes(ptrsize), ptr, ptrsize)
 				if debugBuildCommitTree {
-					fmt.Println(" index", "ch", chstr(int(ch)), "idx", ci, "ptr", off)
+					fmt.Println(" index", "ch", chstr(int(ch)), "ptr", off)
 				}
+				childnr++
 			}
+
+			tw.treeb.Bytes()[childnroff] = byte(childnr - 1)
 		}
 
 		tw.treeb.Bytes()[flagsoff] = flags
@@ -913,7 +934,7 @@ func (u *Used) AddValue(slot, vlen int) {
 }
 
 func (u *Used) Add(u2 Used) {
-	u.prepare(len(u2.Used))
+	u.prepare(len(u2.Used) - 1)
 	for i := 0; i < len(u2.Used); i++ {
 		u.Used[i] += u2.Used[i]
 	}
@@ -927,7 +948,7 @@ func sumLen(a []int) int {
 	return n
 }
 
-func RewriteTree(slots [][]byte, off int, slotsremap []int, used *Used, tw *TreeWriter, sw *SnapshotWriter) int {
+func RewriteTree(slots [][]byte, off int, remove bool, slotsremap []int, used *Used, tw *TreeWriter, sw *SnapshotWriter) int {
 	n := ReadNode(slots[0], off)
 
 	tw.Nodes = tw.Nodes[:0]
@@ -937,7 +958,7 @@ func RewriteTree(slots [][]byte, off int, slotsremap []int, used *Used, tw *Tree
 		n := &tw.Nodes[i]
 		if n.Flags&TagNodeChild != 0 {
 			childstart := len(tw.Nodes)
-			cr := InitChildReader(slots[0], off)
+			cr := InitChildReader(slots[0], int(n.ChildStart))
 			for !cr.End() {
 				_, ptr := cr.Next()
 				cn := ReadNode(slots[0], ptr)
@@ -948,20 +969,43 @@ func RewriteTree(slots [][]byte, off int, slotsremap []int, used *Used, tw *Tree
 		}
 	}
 
+	if remove {
+		for i := len(tw.Nodes) - 1; i >= 0; i-- {
+			n := &tw.Nodes[i]
+			if n.Flags&TagNodeValue != 0 {
+				if n.ValueOp == OpSet {
+					n.ValidNr++
+				}
+			}
+			if n.Flags&TagNodeChild != 0 {
+				n.Flags |= tagNodeCheckValid
+				for ci := n.ChildStart; ci < n.ChildStart+n.ChildNr; ci++ {
+					n.ValidNr += tw.Nodes[ci].ValidNr
+				}
+			}
+		}
+	}
+
+	if debugCompact {
+		fmt.Println("rewrite tree", "off", off, "slotsremap", slotsremap)
+	}
+
 	for i := len(tw.Nodes) - 1; i >= 0; i-- {
 		n := &tw.Nodes[i]
 		if n.Flags&TagNodeValue != 0 {
-			slot := slotsremap[int(n.ValueSlot)]
-			if slot == -1 {
-				// copy
-				newslot, newoff, b := sw.NextValueCopy(int(n.ValueLen))
-				copy(b, n.Value(slots))
-				n.ValueSlot = int32(newslot)
-				n.ValueOff = int32(newoff)
-				used.AddValue(newslot, int(n.ValueLen))
-			} else {
-				// no copy
-				used.AddValue(slot, int(n.ValueLen))
+			if n.ValueOp == OpSet {
+				slot := slotsremap[int(n.ValueSlot)]
+				if slot == -1 {
+					// copy
+					newslot, newoff, b := sw.NextValueCopy(int(n.ValueLen))
+					copy(b, n.Value(slots))
+					n.ValueSlot = int32(newslot)
+					n.ValueOff = int32(newoff)
+					used.AddValue(newslot, int(n.ValueLen))
+				} else {
+					// no copy
+					used.AddValue(slot, int(n.ValueLen))
+				}
 			}
 		}
 	}
@@ -974,7 +1018,7 @@ func ReadHistory(slots [][]byte, head int, maxnr int) []Commit {
 	for {
 		c := ReadCommit(slots, head)
 		history = append(history, c)
-		if len(history) >= maxnr {
+		if maxnr != -1 && len(history) >= maxnr {
 			break
 		}
 		if !c.HasParent() {
@@ -1003,6 +1047,9 @@ func HistoryUsed(slots [][]byte, history []Commit) *Used {
 }
 
 func Compact(slots [][]byte, history []Commit, tw *TreeWriter) (*SnapshotWriter, int) {
+	if len(history) < 2 {
+		panic("invalid")
+	}
 	historyused := HistoryUsed(slots, history)
 
 	oldest := len(history) - 1
@@ -1014,18 +1061,22 @@ func Compact(slots [][]byte, history []Commit, tw *TreeWriter) (*SnapshotWriter,
 	nocopynr := 0
 	for i := 0; i < len(historyused.Used); i++ {
 		if float64(historyused.Used[i])/float64(slotslen[i]) > CompactNoCopyThresold {
-			slotsremap[i] = -1 // no copy
+			slotsremap[i] = i // no copy
 			nocopynr++
 		} else {
-			slotsremap[i] = i // copy
+			slotsremap[i] = -1 // copy
 		}
+	}
+
+	if debugCompact {
+		fmt.Println("compact", "history nr", len(history))
 	}
 
 	sw := NewSnapshotWriter(nocopynr)
 
 	used := &Used{}
 	history[oldest].Flags = TagCommitTree
-	history[oldest].Tree = int32(RewriteTree(slots, int(history[oldest].Tree), slotsremap, used, tw, sw))
+	history[oldest].Tree = int32(RewriteTree(slots, int(history[oldest].Tree), true, slotsremap, used, tw, sw))
 	history[oldest].UsedOff = int32(sw.WriteVarintArray(used.Used))
 	history[oldest].SlotsLenOff = int32(sw.WriteVarintArray(sw.SlotsLen))
 	parent := history[oldest].Write(sw)
@@ -1033,9 +1084,9 @@ func Compact(slots [][]byte, history []Commit, tw *TreeWriter) (*SnapshotWriter,
 	for i := oldest - 1; i >= latest; i-- {
 		diffused := Used{}
 		history[i].Flags = TagCommitTree | TagCommitDiff | TagCommitParent
-		history[i].DiffTree = int32(RewriteTree(slots, int(history[i].DiffTree), slotsremap, &diffused, tw, sw))
+		history[i].DiffTree = int32(RewriteTree(slots, int(history[i].DiffTree), false, slotsremap, &diffused, tw, sw))
 		history[i].DiffUsedOff = int32(sw.WriteVarintArray(diffused.Used))
-		tree := MergeTree(slots, int(history[i+1].Tree), int(history[i].DiffTree), used, tw, sw)
+		tree := MergeTree(sw.Slots, int(history[i+1].Tree), int(history[i].DiffTree), used, tw, sw)
 		used.Add(diffused)
 		history[i].Tree = int32(tree)
 		history[i].UsedOff = int32(sw.WriteVarintArray(used.Used))
@@ -1309,6 +1360,7 @@ func (c *DiffTreeWriter) NextValue(n int) []byte {
 	c.Oplog.ValueSlot = int32(slot)
 	c.Oplog.ValueOff = int32(off)
 	c.Oplog.ValueLen = int32(n)
+	c.Used.AddValue(slot, n)
 	return b
 }
 
