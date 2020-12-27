@@ -7,6 +7,7 @@ import (
 )
 
 func main() {
+	sw := delta.NewSnapshotWriter()
 	tw := &delta.TreeWriter{}
 	trees := []int{}
 
@@ -14,23 +15,15 @@ func main() {
 		c.WriteOplogSet([]byte(s), []byte(s))
 	}
 
-	sw := delta.NewSnapshotWriter(nil)
-
 	if true {
-		c := &delta.DiffTreeWriter{}
-		c.Reset()
-		c.Start()
+		c := &delta.DiffTreeWriter{W: sw}
 		set(c, "123")
 		set(c, "12")
 		set(c, "111")
 		set(c, "1112")
 		set(c, "2435")
-		c.End()
 
-		sw.OrigSlots = c.Slots
-		delta.BuildCommitTree(tw, c.Slots, c.Oplogs)
-
-		h := tw.Write(sw)
+		h := c.WriteTree(tw)
 		trees = append(trees, h)
 
 		fmt.Println("tree", 0)
@@ -38,21 +31,15 @@ func main() {
 	}
 
 	if true {
-		c := &delta.DiffTreeWriter{}
-		c.Reset()
-		c.Start()
+		c := &delta.DiffTreeWriter{W: sw}
 		set(c, "433")
 		set(c, "443")
 		set(c, "4")
 		set(c, "119")
 		set(c, "120")
 		c.WriteOplogRemove([]byte("123"))
-		c.End()
 
-		sw.OrigSlots = c.Slots
-		delta.BuildCommitTree(tw, c.Slots, c.Oplogs)
-
-		h := tw.Write(sw)
+		h := c.WriteTree(tw)
 		trees = append(trees, h)
 
 		fmt.Println("tree", 1)
@@ -60,9 +47,8 @@ func main() {
 	}
 
 	{
-		sw.OrigSlots = sw.Slots
 		delta.MergeTree(sw.Slots, trees[0], trees[1], tw)
-		h := tw.Write(sw)
+		h := tw.Write(sw.Slots, sw)
 		trees = append(trees, h)
 	}
 

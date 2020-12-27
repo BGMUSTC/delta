@@ -296,7 +296,7 @@ func tryPtrsize(tw *TreeWriter, ptrsize int, n *Node) bool {
 	return true
 }
 
-func (tw *TreeWriter) Write(w *SnapshotWriter) int {
+func (tw *TreeWriter) Write(slots [][]byte, w *SnapshotWriter) int {
 	if debugBuildCommitTree {
 		fmt.Println("write")
 	}
@@ -324,10 +324,10 @@ func (tw *TreeWriter) Write(w *SnapshotWriter) int {
 		if n.Flags&TagNodeKey != 0 && n.KeyLen > 0 {
 			flags |= TagNodeKey
 			writeUvarint(&tw.treeb, int(n.KeyLen))
-			path := w.OrigSlots[0][int(n.KeyOff):int(n.KeyOff+n.KeyLen)]
-			tw.treeb.Write(path)
+			key := slots[0][int(n.KeyOff):int(n.KeyOff+n.KeyLen)]
+			tw.treeb.Write(key)
 			if debugBuildCommitTree {
-				fmt.Println(" path", string(path))
+				fmt.Println(" key", string(key))
 			}
 		}
 
@@ -345,12 +345,11 @@ func (tw *TreeWriter) Write(w *SnapshotWriter) int {
 				fmt.Println(" op", n.ValueOp)
 			}
 			if n.ValueOp == OpSet {
-				slot, off := w.WriteValue(int(n.ValueSlot), int(n.ValueOff), int(n.ValueLen))
-				writeUvarint(&tw.treeb, slot)            // slot
-				writeUvarint(&tw.treeb, off)             // off
-				writeUvarint(&tw.treeb, int(n.ValueLen)) // size
+				writeUvarint(&tw.treeb, int(n.ValueSlot)) // slot
+				writeUvarint(&tw.treeb, int(n.ValueOff))  // off
+				writeUvarint(&tw.treeb, int(n.ValueLen))  // size
 				if debugBuildCommitTree {
-					value := w.OrigSlots[int(n.ValueSlot)][int(n.ValueOff):int(n.ValueOff+n.ValueLen)]
+					value := n.Value(w.Slots)
 					fmt.Println(" value", string(value))
 				}
 			}
@@ -373,7 +372,7 @@ func (tw *TreeWriter) Write(w *SnapshotWriter) int {
 
 			for ci := n.ChildStart; ci < n.ChildStart+int32(n.ChildNr); ci++ {
 				c := tw.Nodes[ci]
-				ch := w.OrigSlots[0][int(c.KeyOff)]
+				ch := slots[0][int(c.KeyOff)]
 				tw.treeb.WriteByte(ch)
 				off := int(c.Off)
 				if c.OffIsAbs {
@@ -865,9 +864,8 @@ func debugDfsTree(slots [][]byte, off int, depth int) {
 	fmt.Println("off", n.Off)
 
 	if n.KeyOff != 0 {
-		path := slots[0][int(n.KeyOff):int(n.KeyOff+n.KeyLen)]
 		debugPrintDepth(depth)
-		fmt.Println("path", string(path))
+		fmt.Println("key", string(n.Key(slots)))
 	}
 
 	if n.ValueOp != 0 {
@@ -1023,13 +1021,19 @@ func NewSnapshotWriter() *SnapshotWriter {
 	return w
 }
 
-func (w *SnapshotWriter) reserveValue(n int) {
+func (w *SnapshotWriter) NextValue(n int) (int, int, []byte) {
 	if n > DefaultValueSlotSize {
-		panic("too big")
+		slot := len(w.Slots)
+		off := 0
+		b := make([]byte, n)
+		w.Slots = append(w.Slots, b)
+		w.SlotsLen = append(w.SlotsLen, len(b))
+		return slot, off, b
 	}
+
 	for {
 		if w.SlotsLen[w.WSlot]+n <= len(w.Slots[w.WSlot]) {
-			return
+			break
 		}
 		w.WSlot++
 		if w.WSlot == len(w.Slots) {
@@ -1037,6 +1041,11 @@ func (w *SnapshotWriter) reserveValue(n int) {
 			w.SlotsLen = append(w.SlotsLen, 0)
 		}
 	}
+	slot := w.WSlot
+	off := w.SlotsLen[w.WSlot]
+	b := w.Slots[slot][off : off+n]
+	w.SlotsLen[w.WSlot] += n
+	return slot, off, b
 }
 
 func (w *SnapshotWriter) newSlots() {
@@ -1054,23 +1063,6 @@ func (w *SnapshotWriter) WriteTree(b []byte) {
 	}
 	copy(w.Slots[0][int(w.Slot0Len):], b)
 	w.Slot0Len += len(b)
-}
-
-func (w *SnapshotWriter) WriteValue(b []byte) (int, int) {
-	if len(b) < DefaultValueSlotSize {
-		w.reserveValue(len(b))
-		slot := w.WSlot
-		off := w.SlotsLen[w.WSlot]
-		w.SlotsLen[w.WSlot] += len(b)
-		copy(w.Slots[slot][off:], b)
-		return slot, off
-	} else {
-		slot := len(w.Slots)
-		off := 0
-		w.Slots = append(w.Slots, b)
-		w.SlotsLen = append(w.SlotsLen, len(b))
-		return slot, off
-	}
 }
 
 func (w *SnapshotWriter) WriteSlotsLen() int {
@@ -1115,28 +1107,11 @@ func (d *Delta) RequestSubscribe(c *bufio.ReadWriter) {
 }
 
 type DiffTreeWriter struct {
-	Slots  [][]byte
-	bkey   Buffer
-	Oplogs []Node
-	Oplog  Node
-}
-
-func (c *DiffTreeWriter) Reset(sw *SnapshotWriter) {
-	for i := range c.Slots {
-		c.Slots[i] = nil
-	}
-	c.bkey.Reset()
-	c.Slots = c.Slots[:0]
-	c.Oplogs = c.Oplogs[:0]
-}
-
-func (c *DiffTreeWriter) Start() {
-	c.Slots = append(c.Slots, nil)
-	c.Slots = append(c.Slots, nil)
-}
-
-func (c *DiffTreeWriter) End() {
-	c.Slots[0] = c.bkey.Bytes()
+	W        *SnapshotWriter
+	bkey     Buffer
+	Oplogs   []Node
+	Oplog    Node
+	tmpslots [][]byte
 }
 
 func (c *DiffTreeWriter) WriteOplogSet(k, v []byte) {
@@ -1168,24 +1143,30 @@ func (c *DiffTreeWriter) NextKey(n int) []byte {
 }
 
 func (c *DiffTreeWriter) NextValue(n int) []byte {
-	var b []byte
-	if n < 1024*32 {
-		c.Oplog.ValueSlot = 1
-		c.Oplog.ValueOff = int32(c.bvalue.Len())
-		c.Oplog.ValueLen = int32(n)
-		b = c.bvalue.NextBytes(n)
-	} else {
-		b = make([]byte, n)
-		c.Oplog.ValueSlot = int32(len(c.Slots))
-		c.Oplog.ValueOff = 0
-		c.Oplog.ValueLen = int32(n)
-		c.Slots = append(c.Slots, b)
-	}
+	slot, off, b := c.W.NextValue(n)
+	c.Oplog.ValueSlot = int32(slot)
+	c.Oplog.ValueOff = int32(off)
+	c.Oplog.ValueLen = int32(n)
 	return b
 }
 
 func (c *DiffTreeWriter) EndOplog() {
 	c.Oplogs = append(c.Oplogs, c.Oplog)
+}
+
+func (c *DiffTreeWriter) WriteTree(tw *TreeWriter) int {
+	c.tmpslots = c.tmpslots[:0]
+	c.tmpslots = append(c.tmpslots, c.bkey.Bytes())
+	for i := 1; i < len(c.W.Slots); i++ {
+		c.tmpslots = append(c.tmpslots, c.W.Slots[i])
+	}
+	defer func() {
+		for i := 1; i < len(c.W.Slots); i++ {
+			c.tmpslots[i] = nil
+		}
+	}()
+	BuildCommitTree(tw, c.tmpslots, c.Oplogs)
+	return tw.Write(c.tmpslots, c.W)
 }
 
 type deltaPublish struct {
@@ -1238,9 +1219,6 @@ func (p *deltaPublish) handleCommitOplog() error {
 }
 
 func (p *deltaPublish) handleCommit() error {
-	defer p.tw.Reset()
-	p.tw.Start()
-
 	for {
 		tag, err := p.rw.ReadByte()
 		if err != nil {
@@ -1254,7 +1232,6 @@ func (p *deltaPublish) handleCommit() error {
 			}
 
 		case 0:
-			p.tw.End()
 			return nil
 		}
 	}
