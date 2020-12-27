@@ -887,15 +887,18 @@ func debugDfsTree(slots [][]byte, off int, depth int) {
 	debugPrintDepth(depth)
 	fmt.Println("off", n.Off)
 
-	if n.KeyOff != 0 {
+	if n.Flags&TagNodeKey != 0 {
 		debugPrintDepth(depth)
 		fmt.Println("key", string(n.Key(slots)))
 	}
 
-	if n.ValueOp != 0 {
+	if n.Flags&TagNodeValue != 0 {
 		debugPrintDepth(depth)
-		value := slots[int(n.ValueSlot)][int(n.ValueOff):int(n.ValueOff+n.ValueLen)]
-		fmt.Println("value", string(value), "op", n.ValueOp)
+		fmt.Println("op", n.ValueOp)
+		if n.ValueOp == OpSet {
+			debugPrintDepth(depth)
+			fmt.Println("value", string(n.Value(slots)))
+		}
 	}
 
 	if n.ChildStart != 0 {
@@ -1059,7 +1062,7 @@ func Compact(slots [][]byte, history []Commit, tw *TreeWriter) (*SnapshotWriter,
 
 	slotsremap := make([]int, len(slotslen))
 	nocopynr := 0
-	for i := 0; i < len(historyused.Used); i++ {
+	for i := 1; i < len(historyused.Used); i++ {
 		if float64(historyused.Used[i])/float64(slotslen[i]) > CompactNoCopyThresold {
 			slotsremap[i] = i // no copy
 			nocopynr++
@@ -1073,6 +1076,9 @@ func Compact(slots [][]byte, history []Commit, tw *TreeWriter) (*SnapshotWriter,
 	}
 
 	sw := NewSnapshotWriter(nocopynr)
+	for i := 1; i < nocopynr+1; i++ {
+		sw.Slots[i] = slots[i]
+	}
 
 	used := &Used{}
 	history[oldest].Flags = TagCommitTree
