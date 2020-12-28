@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 
 	"github.com/nareix/delta"
 )
@@ -26,9 +27,6 @@ func testSimple() {
 	if true {
 		c := oplogs([]string{"123", "12", "111", "1112", "2435"}, nil)
 		h := c.WriteTree(tw, sw)
-		// for _, o := range c.Oplogs {
-		// 	fmt.Println("o", o.Value(sw.Slots))
-		// }
 		trees = append(trees, h)
 
 		fmt.Println("tree", 0)
@@ -106,8 +104,23 @@ func testCompact() {
 	delta.DebugDfsTree(sw2.Slots, int(c2.FullTree))
 }
 
+type ReadWriter struct {
+	io.Reader
+	io.Writer
+}
+
+func newConn2() (ReadWriter, ReadWriter) {
+	r, w := io.Pipe()
+	r1, w1 := io.Pipe()
+	c := ReadWriter{Reader: r, Writer: w1}
+	c1 := ReadWriter{Reader: r1, Writer: w}
+	return c, c1
+}
+
 func testDelta() {
-	// d := delta.NewDelta()
+	d := delta.NewDelta()
+	c0, c1 := newConn2()
+	d.HandleConn(c0)
 }
 
 func testEmptyTree() {

@@ -1373,109 +1373,9 @@ func (c *DiffTreeWriter) WriteTree(tw *TreeWriter, sw *SnapshotWriter) int {
 			c.Usage.AddValue(int(n.ValueSlot), int(n.ValueLen))
 		}
 	}
+
 	BuildCommitTree(tw, c.Slots, c.Oplogs)
 	return tw.Write(c.Slots, sw)
-}
-
-type Delta struct {
-	sub      sync.Map
-	snapshot unsafe.Pointer
-	publ     sync.Mutex
-	sw       *SnapshotWriter
-	tw       TreeWriter
-	usage    *Usage
-	parent   Commit
-}
-
-func NewDelta() *Delta {
-	sw := NewSnapshotWriter(0)
-	tree := WriteEmptyTree(sw)
-	c0 := Commit{
-		Flags:   TagCommitFull,
-		Time:    time.Now().Unix(),
-		Version: 1,
-	}
-	c0.FullTree = int32(tree)
-	c0.Off = int32(c0.Write(sw))
-	d := &Delta{
-		sw:     sw,
-		parent: c0,
-		usage:  &Usage{},
-	}
-	s := &Snapshot{
-		Slots:   sw.Slots,
-		HeadOff: int(c0.Off),
-	}
-	d.setSnapshot(s)
-	return d
-}
-
-func (d *Delta) setSnapshot(s *Snapshot) {
-	atomic.StorePointer(&d.snapshot, unsafe.Pointer(s))
-}
-
-func (d *Delta) getSnapshot() *Snapshot {
-	return (*Snapshot)(atomic.LoadPointer(&d.snapshot))
-}
-
-func (d *Delta) Commit(diff *DiffTreeWriter) {
-	d.publ.Lock()
-	defer d.publ.Unlock()
-
-	c := Commit{
-		Flags:   TagCommitFull | TagCommitParent | TagCommitDiff,
-		Time:    time.Now().Unix(),
-		Version: d.parent.Version + 1,
-	}
-	c.DiffTree = int32(diff.WriteTree(&d.tw, d.sw))
-	c.DiffUsageOff = int32(d.sw.WriteVarintArray(diff.Usage.Usage))
-	d.usage.Add(diff.Usage)
-	tree := MergeTree(d.sw.Slots, int(d.parent.FullTree), int(c.DiffTree), d.usage, &d.tw, d.sw)
-	c.FullTree = int32(tree)
-	c.FullUsageOff = int32(d.sw.WriteVarintArray(d.usage.Usage))
-	c.Parent = int32(d.parent.Off)
-	c.SlotsLenOff = int32(d.sw.WriteVarintArray(d.sw.SlotsLen))
-	c.Off = int32(c.Write(d.sw))
-	d.parent = c
-
-	d.notifyAll()
-}
-
-func (d *Delta) compactLoop() {
-	for {
-		func() {
-			d.publ.Lock()
-			defer d.publ.Unlock()
-
-			history := ReadHistory(d.sw.Slots, int(d.parent.Off), 4)
-			d.sw, d.parent, d.usage = Compact(d.sw.Slots, history, &d.tw)
-			d.setSnapshot(&Snapshot{
-				Slots:   d.sw.Slots,
-				HeadOff: int(d.parent.Off),
-			})
-		}()
-		time.Sleep(time.Second * 3)
-	}
-}
-
-func (d *Delta) Subscribe() (chan struct{}, func()) {
-	notify := make(chan struct{}, 1)
-	remove := func() {
-		d.sub.Delete(notify)
-	}
-	d.sub.Store(notify, nil)
-	return notify, remove
-}
-
-func (d *Delta) notifyAll() {
-	d.sub.Range(func(k, _ interface{}) bool {
-		notify := k.(chan struct{})
-		select {
-		case notify <- struct{}{}:
-		default:
-		}
-		return true
-	})
 }
 
 // SyncProto v1
@@ -1563,6 +1463,21 @@ func (p *SyncProto) WriteHeader() error {
 		}
 	}
 	return p.rw.Flush()
+}
+
+func (p *SyncProto) WriteTreeVersion(version int) error {
+	if err := p.uw.WriteUvarint(version); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (p *SyncProto) ReadTreeVersion() (int, error) {
+	version, err := binary.ReadUvarint(p.rw)
+	if err != nil {
+		return -1, err
+	}
+	return int(version), nil
 }
 
 func (p *SyncProto) WriteOplog(op int, k, v []byte) error {
@@ -1662,15 +1577,145 @@ func (p *SyncProto) ReadTree() error {
 	}
 }
 
-func syncVersion(p *SyncProto, s *Snapshot, version int) error {
+type Delta struct {
+	sub      sync.Map
+	snapshot unsafe.Pointer
+	publ     sync.Mutex
+	sw       *SnapshotWriter
+	tw       TreeWriter
+	usage    *Usage
+	head     Commit
+}
+
+func (d *Delta) setSnapshot(s *Snapshot) {
+	atomic.StorePointer(&d.snapshot, unsafe.Pointer(s))
+}
+
+func (d *Delta) updateSnapshot() {
+	d.setSnapshot(&Snapshot{
+		Slots:   d.sw.Slots,
+		HeadOff: int(d.head.Off),
+	})
+}
+
+func (d *Delta) Snapshot() *Snapshot {
+	return (*Snapshot)(atomic.LoadPointer(&d.snapshot))
+}
+
+func (d *Delta) Commit(diff *DiffTreeWriter, version int, checkversion bool) bool {
+	d.publ.Lock()
+	defer d.publ.Unlock()
+
+	if checkversion {
+		if int(d.head.Version+1) != version {
+			return false
+		}
+	}
+
+	c := Commit{
+		Flags:   TagCommitFull | TagCommitParent | TagCommitDiff,
+		Time:    time.Now().Unix(),
+		Version: d.head.Version + 1,
+	}
+	c.DiffTree = int32(diff.WriteTree(&d.tw, d.sw))
+	c.DiffUsageOff = int32(d.sw.WriteVarintArray(diff.Usage.Usage))
+	d.usage.Add(diff.Usage)
+	tree := MergeTree(d.sw.Slots, int(d.head.FullTree), int(c.DiffTree), d.usage, &d.tw, d.sw)
+	c.FullTree = int32(tree)
+	c.FullUsageOff = int32(d.sw.WriteVarintArray(d.usage.Usage))
+	c.Parent = int32(d.head.Off)
+	c.SlotsLenOff = int32(d.sw.WriteVarintArray(d.sw.SlotsLen))
+	c.Off = int32(c.Write(d.sw))
+	d.head = c
+
+	d.updateSnapshot()
+	d.notifyAll()
+
+	return true
+}
+
+func (d *Delta) Compact() {
+	d.publ.Lock()
+	defer d.publ.Unlock()
+
+	history := ReadHistory(d.sw.Slots, int(d.head.Off), 4)
+	d.sw, d.head, d.usage = Compact(d.sw.Slots, history, &d.tw)
+	d.updateSnapshot()
+}
+
+func (d *Delta) compactLoop() {
+	for {
+		d.Compact()
+		time.Sleep(time.Second * 3)
+	}
+}
+
+func (d *Delta) Restart(full *DiffTreeWriter, newversion int, checkversion bool) bool {
+	d.publ.Lock()
+	defer d.publ.Unlock()
+
+	if checkversion {
+		if newversion <= int(d.head.Version) {
+			return false
+		}
+	}
+
+	d.sw = NewSnapshotWriter(0)
+	tree := full.WriteTree(&d.tw, d.sw)
+
+	d.usage.Reset()
+	d.usage.Add(full.Usage)
+
+	c := Commit{
+		Flags:   TagCommitFull,
+		Time:    time.Now().Unix(),
+		Version: int32(newversion),
+	}
+	c.FullTree = int32(tree)
+	c.FullUsageOff = int32(d.sw.WriteVarintArray(d.usage.Usage))
+	c.SlotsLenOff = int32(d.sw.WriteVarintArray(d.sw.SlotsLen))
+	c.Off = int32(c.Write(d.sw))
+	d.head = c
+
+	d.updateSnapshot()
+	d.notifyAll()
+
+	return true
+}
+
+func (d *Delta) Subscribe() (chan struct{}, func()) {
+	notify := make(chan struct{}, 1)
+	unsub := func() {
+		d.sub.Delete(notify)
+	}
+	d.sub.Store(notify, nil)
+	return notify, unsub
+}
+
+func (d *Delta) notifyAll() {
+	d.sub.Range(func(k, _ interface{}) bool {
+		notify := k.(chan struct{})
+		select {
+		case notify <- struct{}{}:
+		default:
+		}
+		return true
+	})
+}
+
+func syncVersion(p *SyncProto, s *Snapshot, oldversion int) error {
 	c := ReadCommit(s.Slots, s.HeadOff)
-	diffversion := int(c.Version) - version
+	newversion := int(c.Version)
+	diffversion := newversion - oldversion
 	if diffversion <= 0 {
 		return nil
 	}
 	history := ReadHistory(s.Slots, s.HeadOff, diffversion)
 	if len(history) < diffversion {
 		if err := p.WriteTreeStart(SPTypeFull); err != nil {
+			return err
+		}
+		if err := p.WriteTreeVersion(newversion); err != nil {
 			return err
 		}
 		if err := p.WriteTree(s.Slots, int(c.FullTree)); err != nil {
@@ -1691,6 +1736,54 @@ func syncVersion(p *SyncProto, s *Snapshot, version int) error {
 			}
 		}
 		return nil
+	}
+}
+
+func (d *Delta) RequestSubscribeConn(rw0 io.ReadWriter) error {
+	rw := bufio.NewReadWriter(
+		bufio.NewReaderSize(rw0, 128),
+		bufio.NewWriterSize(rw0, 128),
+	)
+	s := d.Snapshot()
+	c := ReadCommit(s.Slots, s.HeadOff)
+
+	p := NewSyncProto(rw)
+	p.Role = SPRoleSubscribe
+	p.Version = int(c.Version)
+
+	version := int(c.Version)
+
+	if err := p.WriteHeader(); err != nil {
+		return err
+	}
+
+	for {
+		typ, err := p.ReadTreeStart()
+		if err != nil {
+			return err
+		}
+		switch typ {
+		case SPTypeDiff:
+			if err := p.ReadTree(); err != nil {
+				return err
+			}
+			version++
+			d.Commit(&p.DW, version, true)
+
+		case SPTypeFull:
+			if err := p.ReadTree(); err != nil {
+				return err
+			}
+			newversion, err := p.ReadTreeVersion()
+			if err != nil {
+				return err
+			}
+			d.Restart(&p.DW, newversion, true)
+			version = newversion
+
+		default:
+			return ErrProto
+		}
 	}
 }
 
@@ -1717,7 +1810,7 @@ func (d *Delta) HandleConn(rw0 io.ReadWriter) error {
 				if err := p.ReadTree(); err != nil {
 					return err
 				}
-				d.Commit(&p.DW)
+				d.Commit(&p.DW, -1, false)
 
 			default:
 				return ErrProto
@@ -1735,7 +1828,7 @@ func (d *Delta) HandleConn(rw0 io.ReadWriter) error {
 		}()
 
 		for {
-			s := d.getSnapshot()
+			s := d.Snapshot()
 			if err := syncVersion(p, s, p.Version); err != nil {
 				return err
 			}
@@ -1750,4 +1843,23 @@ func (d *Delta) HandleConn(rw0 io.ReadWriter) error {
 	default:
 		return ErrProto
 	}
+}
+
+func NewDelta() *Delta {
+	sw := NewSnapshotWriter(0)
+	tree := WriteEmptyTree(sw)
+	c0 := Commit{
+		Flags:   TagCommitFull,
+		Time:    time.Now().Unix(),
+		Version: 1,
+	}
+	c0.FullTree = int32(tree)
+	c0.Off = int32(c0.Write(sw))
+	d := &Delta{
+		sw:    sw,
+		head:  c0,
+		usage: &Usage{},
+	}
+	d.updateSnapshot()
+	return d
 }
