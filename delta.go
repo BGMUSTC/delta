@@ -821,13 +821,15 @@ type rangeDfs struct {
 func (d *rangeDfs) search() error {
 	key := d.n.Key(d.slots)
 	d.prefix = append(d.prefix, key...)
-	if d.all {
-		if err := d.fn2(int(d.n.ValueOp), d.prefix, d.n.Value(d.slots)); err != nil {
-			return err
-		}
-	} else {
-		if d.n.ValueOp == OpSet {
-			d.fn(d.prefix, d.n.Value(d.slots))
+	if d.n.Flags&TagNodeValue != 0 {
+		if d.all {
+			if err := d.fn2(int(d.n.ValueOp), d.prefix, d.n.Value(d.slots)); err != nil {
+				return err
+			}
+		} else {
+			if d.n.ValueOp == OpSet {
+				d.fn(d.prefix, d.n.Value(d.slots))
+			}
 		}
 	}
 	cr := InitChildReader(d.slots[0], int(d.n.ChildStart))
@@ -1330,6 +1332,7 @@ func (c *DiffTreeWriter) Remove(k []byte) {
 func (c *DiffTreeWriter) AppendOplog(n Node) {
 	n.Off = int32(len(c.Oplogs))
 	c.Oplogs = append(c.Oplogs, n)
+	c.Slots[0] = c.b.Bytes()
 }
 
 func (c *DiffTreeWriter) NextKey(n int) (int, []byte) {
@@ -1703,39 +1706,48 @@ func (d *Delta) notifyAll() {
 	})
 }
 
-func syncVersion(p *SyncProto, s *Snapshot, oldversion int) error {
+const debugDelta = false
+
+func syncVersion(p *SyncProto, s *Snapshot, oldversion int) (int, error) {
 	c := ReadCommit(s.Slots, s.HeadOff)
+
 	newversion := int(c.Version)
 	diffversion := newversion - oldversion
+
 	if diffversion <= 0 {
-		return nil
+		return newversion, nil
 	}
+
 	history := ReadHistory(s.Slots, s.HeadOff, diffversion)
+
 	if len(history) < diffversion {
 		if err := p.WriteTreeStart(SPTypeFull); err != nil {
-			return err
+			return -1, err
 		}
 		if err := p.WriteTreeVersion(newversion); err != nil {
-			return err
+			return -1, err
 		}
 		if err := p.WriteTree(s.Slots, int(c.FullTree)); err != nil {
-			return err
+			return -1, err
 		}
-		return p.WriteTreeEnd()
+		if err := p.WriteTreeEnd(); err != nil {
+			return -1, err
+		}
+		return newversion, nil
 	} else {
 		for i := len(history) - 1; i >= 0; i-- {
 			c := history[i]
 			if err := p.WriteTreeStart(SPTypeDiff); err != nil {
-				return err
+				return -1, err
 			}
 			if err := p.WriteTree(s.Slots, int(c.DiffTree)); err != nil {
-				return err
+				return -1, err
 			}
 			if err := p.WriteTreeEnd(); err != nil {
-				return err
+				return -1, err
 			}
 		}
-		return nil
+		return newversion, nil
 	}
 }
 
@@ -1810,7 +1822,10 @@ func (d *Delta) HandleConn(rw0 io.ReadWriter) error {
 				if err := p.ReadTree(); err != nil {
 					return err
 				}
-				d.Commit(&p.DW, -1, false)
+				ok := d.Commit(&p.DW, -1, false)
+				if debugDelta {
+					fmt.Println("publish", ok)
+				}
 
 			default:
 				return ErrProto
@@ -1827,11 +1842,15 @@ func (d *Delta) HandleConn(rw0 io.ReadWriter) error {
 			cancel()
 		}()
 
+		version := p.Version
+
 		for {
 			s := d.Snapshot()
-			if err := syncVersion(p, s, p.Version); err != nil {
+			newversion, err := syncVersion(p, s, version)
+			if err != nil {
 				return err
 			}
+			version = newversion
 
 			select {
 			case <-ctx.Done():
@@ -1853,12 +1872,14 @@ func NewDelta() *Delta {
 		Time:    time.Now().Unix(),
 		Version: 1,
 	}
+	usage := &Usage{}
 	c0.FullTree = int32(tree)
+	c0.FullUsageOff = int32(sw.WriteVarintArray(usage.Usage))
 	c0.Off = int32(c0.Write(sw))
 	d := &Delta{
 		sw:    sw,
 		head:  c0,
-		usage: &Usage{},
+		usage: usage,
 	}
 	d.updateSnapshot()
 	return d

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 
@@ -24,7 +25,7 @@ func testSimple() {
 	tw := &delta.TreeWriter{}
 	trees := []int{}
 
-	if true {
+	{
 		c := oplogs([]string{"123", "12", "111", "1112", "2435"}, nil)
 		h := c.WriteTree(tw, sw)
 		trees = append(trees, h)
@@ -33,7 +34,7 @@ func testSimple() {
 		delta.DebugDfsTree(sw.Slots, h)
 	}
 
-	if true {
+	{
 		c := oplogs([]string{"433", "443", "4", "119", "120"}, []string{"123"})
 		h := c.WriteTree(tw, sw)
 		trees = append(trees, h)
@@ -88,39 +89,35 @@ func testCompact() {
 	for i, c := range history {
 		fmt.Println("history", i)
 		if c.Flags&delta.TagCommitFull != 0 {
-			fmt.Println("used", delta.ReadVarintArray(nil, sw.Slots, int(c.FullUsageOff)))
-			// fmt.Println("tree", i)
-			// delta.DebugDfsTree(sw.Slots, int(c.Tree))
+			fmt.Println("usage", delta.ReadVarintArray(nil, sw.Slots, int(c.FullUsageOff)))
 		}
 		if c.Flags&delta.TagCommitDiff != 0 {
-			fmt.Println("diff used", delta.ReadVarintArray(nil, sw.Slots, int(c.DiffUsageOff)))
-			// fmt.Println("diff tree", i)
-			// delta.DebugDfsTree(sw.Slots, int(c.DiffTree))
+			fmt.Println("diff usage", delta.ReadVarintArray(nil, sw.Slots, int(c.DiffUsageOff)))
 		}
 	}
 
 	sw2, c2, _ := delta.Compact(sw.Slots, history, tw)
-	fmt.Println("sw2", sw2.Slot0Len)
 	delta.DebugDfsTree(sw2.Slots, int(c2.FullTree))
 }
 
-type ReadWriter struct {
-	io.Reader
-	io.Writer
+type PipeReadWriter struct {
+	*io.PipeReader
+	*io.PipeWriter
 }
 
-func newConn2() (ReadWriter, ReadWriter) {
+func newConn2() (PipeReadWriter, PipeReadWriter) {
 	r, w := io.Pipe()
 	r1, w1 := io.Pipe()
-	c := ReadWriter{Reader: r, Writer: w1}
-	c1 := ReadWriter{Reader: r1, Writer: w}
+	c := PipeReadWriter{PipeReader: r, PipeWriter: w1}
+	c1 := PipeReadWriter{PipeReader: r1, PipeWriter: w}
 	return c, c1
 }
 
-func testDelta() {
-	d := delta.NewDelta()
-	c0, c1 := newConn2()
-	d.HandleConn(c0)
+func newBufioRW(rw PipeReadWriter) *bufio.ReadWriter {
+	return bufio.NewReadWriter(
+		bufio.NewReaderSize(rw, 128),
+		bufio.NewWriterSize(rw, 128),
+	)
 }
 
 func testEmptyTree() {
@@ -128,4 +125,65 @@ func testEmptyTree() {
 	emptytree := delta.WriteEmptyTree(sw)
 	delta.Range(sw.Slots, emptytree, nil, func(k, v []byte) {
 	})
+}
+
+func ExampleDelta() {
+	d0 := delta.NewDelta()
+	d1 := delta.NewDelta()
+	d2 := delta.NewDelta()
+
+	{
+		c0, c1 := newConn2()
+		go d0.HandleConn(c0)
+		go d1.RequestSubscribeConn(c1)
+	}
+
+	{
+		c0, c1 := newConn2()
+		go d1.HandleConn(c0)
+		go d2.RequestSubscribeConn(c1)
+	}
+
+	{
+		c0, c1 := newConn2()
+		go d0.HandleConn(c0)
+		p := delta.NewSyncProto(newBufioRW(c1))
+		p.Role = delta.SPRolePulish
+		p.WriteHeader()
+
+		p.WriteTreeStart(delta.SPTypeDiff)
+		p.WriteOplog(delta.OpSet, []byte("123"), []byte("123"))
+		p.WriteTreeEnd()
+
+		p.WriteTreeStart(delta.SPTypeDiff)
+		p.WriteOplog(delta.OpSet, []byte("456"), []byte("456"))
+		p.WriteTreeEnd()
+	}
+
+	{
+		c0, c1 := newConn2()
+		go d2.HandleConn(c0)
+		p := delta.NewSyncProto(newBufioRW(c1))
+		p.Role = delta.SPRoleSubscribe
+		p.Version = 1
+		p.WriteHeader()
+		for i := 0; i < 2; i++ {
+			typ, _ := p.ReadTreeStart()
+			switch typ {
+			case delta.SPTypeFull:
+				fmt.Println("full")
+				p.ReadTreeVersion()
+			case delta.SPTypeDiff:
+				fmt.Println("diff")
+				p.ReadTree()
+				for _, o := range p.DW.Oplogs {
+					if o.ValueOp == delta.OpSet {
+						fmt.Println("k", string(o.Key(p.DW.Slots)), "v", string(o.Value(p.DW.Slots)))
+					}
+				}
+			default:
+				panic("invalid")
+			}
+		}
+	}
 }
