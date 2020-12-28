@@ -3,6 +3,7 @@ package delta
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 )
@@ -30,22 +32,27 @@ const (
 )
 
 const (
-	OpSet = iota + 1
-	OpRemove
+	OpSet    = 1
+	OpRemove = 2
 )
 
 const (
-	TagPublishCommit = iota + 1
+	TagPublishCommit = 1
 )
 
 const (
-	TagPublishCommitOplog = iota + 1
+	TagPublishCommitOplog = 1
 )
 
 const (
-	TagPublishCommitOplogOp = iota + 1
-	TagPublishCommitOplogKey
-	TagPublishCommitOplogValue
+	TagPublishCommitOplogOp    = 1
+	TagPublishCommitOplogKey   = 2
+	TagPublishCommitOplogValue = 3
+)
+
+const (
+	TagSubscribeFull = 1
+	TagSubscribeDiff = 2
 )
 
 const (
@@ -1049,7 +1056,7 @@ func HistoryUsed(slots [][]byte, history []Commit) *Used {
 	return used
 }
 
-func Compact(slots [][]byte, history []Commit, tw *TreeWriter) (*SnapshotWriter, int) {
+func Compact(slots [][]byte, history []Commit, tw *TreeWriter) (*SnapshotWriter, Commit, *Used) {
 	if len(history) < 2 {
 		panic("invalid")
 	}
@@ -1085,7 +1092,7 @@ func Compact(slots [][]byte, history []Commit, tw *TreeWriter) (*SnapshotWriter,
 	history[oldest].Tree = int32(RewriteTree(slots, int(history[oldest].Tree), true, slotsremap, used, tw, sw))
 	history[oldest].UsedOff = int32(sw.WriteVarintArray(used.Used))
 	history[oldest].SlotsLenOff = int32(sw.WriteVarintArray(sw.SlotsLen))
-	parent := history[oldest].Write(sw)
+	history[oldest].Off = int32(history[oldest].Write(sw))
 
 	for i := oldest - 1; i >= latest; i-- {
 		diffused := Used{}
@@ -1097,17 +1104,17 @@ func Compact(slots [][]byte, history []Commit, tw *TreeWriter) (*SnapshotWriter,
 		history[i].Tree = int32(tree)
 		history[i].UsedOff = int32(sw.WriteVarintArray(used.Used))
 		history[i].SlotsLenOff = int32(sw.WriteVarintArray(sw.SlotsLen))
-		history[i].Parent = int32(parent)
-		parent = history[i].Write(sw)
+		history[i].Parent = int32(history[i+1].Off)
+		history[i].Off = int32(history[i].Write(sw))
 	}
 
-	return sw, parent
+	return sw, history[latest], used
 }
 
 var CompactTotalUsedThresold = 0.5
 var CompactNoCopyThresold = 0.8
 
-func TryCompact(slots [][]byte, head int, tw *TreeWriter) {
+func ShouldCompact(slots [][]byte, head int) (bool, []Commit) {
 	history := []Commit{}
 	now := time.Now()
 	for {
@@ -1116,7 +1123,7 @@ func TryCompact(slots [][]byte, head int, tw *TreeWriter) {
 		if now.Sub(ctime) > time.Second {
 			break
 		}
-		if len(history) > 64 {
+		if len(history) > 32 {
 			break
 		}
 		history = append(history, c)
@@ -1126,24 +1133,23 @@ func TryCompact(slots [][]byte, head int, tw *TreeWriter) {
 		head = int(c.Parent)
 	}
 	if len(history) < 2 {
-		return
+		return false, nil
 	}
 
 	latest := 0
-
 	used := HistoryUsed(slots, history)
-
 	slotslen := ReadVarintArray(nil, slots, int(history[latest].SlotsLenOff))
-
 	totallen := sumLen(slotslen)
 	totalused := sumLen(used.Used)
-
 	if float64(totalused)/float64(totallen) > CompactTotalUsedThresold {
-		return
+		return false, nil
 	}
+
+	return true, history
 }
 
 type Commit struct {
+	Off         int32
 	Flags       byte
 	Version     int32
 	Time        int64
@@ -1161,7 +1167,7 @@ func (c Commit) HasParent() bool {
 
 func ReadCommit(slots [][]byte, off int) Commit {
 	r := ProtoReader{B: slots[0], Off: off}
-	c := Commit{}
+	c := Commit{Off: int32(off)}
 	c.Flags = r.ReadU8()
 	c.Version = int32(r.ReadUvarint())
 	c.Time = int64(r.ReadUvarint())
@@ -1210,8 +1216,8 @@ func ReadVarintArray(a []int, slots [][]byte, off int) []int {
 	return a
 }
 
-var DefaultValueSlotSize = 1024 * 128
-var DefaultTreeSlotSize = 1024 * 128
+var DefaultValueSlotSize = 1024 * 16
+var DefaultTreeSlotSize = 1024 * 16
 
 type SnapshotWriter struct {
 	Slots    [][]byte
@@ -1292,31 +1298,8 @@ func (w *SnapshotWriter) WriteVarintArray(a []int) int {
 }
 
 type Snapshot struct {
-	Slots    [][]byte
-	Slot0Len int
-	WSlot    int
-	HeadOff  int
-}
-
-type Delta struct {
-	sub      sync.Map
-	snapshot unsafe.Pointer
-	publ     sync.Mutex
-}
-
-func (d *Delta) Subscribe() (chan struct{}, func()) {
-	notify := make(chan struct{}, 1)
-	remove := func() {
-		d.sub.Delete(notify)
-	}
-	d.sub.Store(notify, nil)
-	return notify, remove
-}
-
-func (d *Delta) notifyAll() {
-}
-
-func (d *Delta) RequestSubscribe(c *bufio.ReadWriter) {
+	Slots   [][]byte
+	HeadOff int
 }
 
 type DiffTreeWriter struct {
@@ -1390,9 +1373,9 @@ func (c *DiffTreeWriter) WriteTree(tw *TreeWriter) int {
 }
 
 type deltaPublish struct {
-	d  *Delta
-	rw *bufio.ReadWriter
-	tw DiffTreeWriter
+	d    *Delta
+	rw   *bufio.ReadWriter
+	diff DiffTreeWriter
 }
 
 func (p *deltaPublish) handleCommitOplog() error {
@@ -1408,26 +1391,26 @@ func (p *deltaPublish) handleCommitOplog() error {
 			if err != nil {
 				return err
 			}
-			p.tw.Oplog.ValueOp = int32(v)
+			p.diff.Oplog.ValueOp = int32(v)
 
 		case TagPublishCommitOplogKey:
-			v, err := p.rw.ReadByte()
+			v, err := binary.ReadVarint(p.rw)
 			if err != nil {
 				return err
 			}
 			blen := int(v)
-			key := p.tw.NextKey(blen)
+			key := p.diff.NextKey(blen)
 			if _, err := io.ReadFull(p.rw, key); err != nil {
 				return err
 			}
 
 		case TagPublishCommitOplogValue:
-			v, err := p.rw.ReadByte()
+			v, err := binary.ReadVarint(p.rw)
 			if err != nil {
 				return err
 			}
 			blen := int(v)
-			value := p.tw.NextValue(blen)
+			value := p.diff.NextValue(blen)
 			if _, err := io.ReadFull(p.rw, value); err != nil {
 				return err
 			}
@@ -1439,6 +1422,11 @@ func (p *deltaPublish) handleCommitOplog() error {
 }
 
 func (p *deltaPublish) handleCommit() error {
+	p.d.publ.Lock() // TODO
+	defer p.d.publ.Unlock()
+
+	p.diff.Reset()
+
 	for {
 		tag, err := p.rw.ReadByte()
 		if err != nil {
@@ -1452,6 +1440,7 @@ func (p *deltaPublish) handleCommit() error {
 			}
 
 		case 0:
+			p.d.commit(&p.diff)
 			return nil
 		}
 	}
@@ -1474,13 +1463,175 @@ func (p *deltaPublish) handle() error {
 	}
 }
 
+type Delta struct {
+	sub      sync.Map
+	snapshot unsafe.Pointer
+	publ     sync.Mutex
+	sw       *SnapshotWriter
+	tw       TreeWriter
+	used     *Used
+	parent   Commit
+}
+
+func NewDelta() *Delta {
+	sw := NewSnapshotWriter(0)
+	tree := WriteEmptyTree(sw)
+	c0 := Commit{
+		Flags:   TagCommitTree,
+		Time:    time.Now().Unix(),
+		Version: 1,
+	}
+	c0.Tree = int32(tree)
+	c0.Off = int32(c0.Write(sw))
+	d := &Delta{
+		sw:     sw,
+		parent: c0,
+		used:   &Used{},
+	}
+	s := &Snapshot{
+		Slots:   sw.Slots,
+		HeadOff: int(c0.Off),
+	}
+	d.setSnapshot(s)
+	return d
+}
+
+func (d *Delta) setSnapshot(s *Snapshot) {
+	atomic.StorePointer(&d.snapshot, unsafe.Pointer(s))
+}
+
+func (d *Delta) getSnapshot() *Snapshot {
+	return (*Snapshot)(atomic.LoadPointer(&d.snapshot))
+}
+
+func (d *Delta) commit(diff *DiffTreeWriter) {
+	c := Commit{
+		Flags:   TagCommitTree | TagCommitParent | TagCommitDiff,
+		Time:    time.Now().Unix(),
+		Version: d.parent.Version + 1,
+	}
+	c.DiffTree = int32(diff.WriteTree(&d.tw))
+	c.DiffUsedOff = int32(d.sw.WriteVarintArray(diff.Used.Used))
+	d.used.Add(diff.Used)
+	tree := MergeTree(d.sw.Slots, int(d.parent.Tree), int(c.DiffTree), d.used, &d.tw, d.sw)
+	c.Tree = int32(tree)
+	c.UsedOff = int32(d.sw.WriteVarintArray(d.used.Used))
+	c.Parent = int32(d.parent.Off)
+	c.SlotsLenOff = int32(d.sw.WriteVarintArray(d.sw.SlotsLen))
+	c.Off = int32(c.Write(d.sw))
+	d.parent = c
+
+	d.notifyAll()
+}
+
+func (d *Delta) compactLoop() {
+	for {
+		func() {
+			d.publ.Lock()
+			defer d.publ.Unlock()
+
+			history := ReadHistory(d.sw.Slots, int(d.parent.Off), 4)
+			d.sw, d.parent, d.used = Compact(d.sw.Slots, history, &d.tw)
+			d.setSnapshot(&Snapshot{
+				Slots:   d.sw.Slots,
+				HeadOff: int(d.parent.Off),
+			})
+		}()
+		time.Sleep(time.Second * 3)
+	}
+}
+
+func (d *Delta) Subscribe() (chan struct{}, func()) {
+	notify := make(chan struct{}, 1)
+	remove := func() {
+		d.sub.Delete(notify)
+	}
+	d.sub.Store(notify, nil)
+	return notify, remove
+}
+
+func (d *Delta) notifyAll() {
+	d.sub.Range(func(k, _ interface{}) bool {
+		notify := k.(chan struct{})
+		select {
+		case notify <- struct{}{}:
+		default:
+		}
+		return true
+	})
+}
+
+func writeFull(s *Snapshot, c Commit, rw *bufio.ReadWriter) error {
+	b := &Buffer{}
+	b.WriteByte(TagSubscribeFull)
+	writeUvarint(b, int(c.Version))
+	Range(s.Slots, int(c.Tree), nil, func(k, v []byte) {
+		b.WriteByte(TagPublishCommit)
+		b.WriteByte(OpSet)
+		writeUvarint(b, int(len(k)))
+		b.Write(k)
+		writeUvarint(b, int(len(v)))
+		b.Write(v)
+	})
+	b.WriteByte(0)
+	_, err := rw.Write(b.Bytes())
+	return err
+}
+
+func writeDiff(diff []Commit, rw *bufio.ReadWriter) error {
+	return fmt.Errorf("unimplemented")
+}
+
+func syncVersion(s *Snapshot, version int, rw *bufio.ReadWriter) error {
+	c := ReadCommit(s.Slots, s.HeadOff)
+	diffversion := int(c.Version) - version
+	if diffversion <= 0 {
+		return nil
+	}
+	history := ReadHistory(s.Slots, s.HeadOff, diffversion)
+	if len(history) < diffversion {
+		return writeFull(s, c, rw)
+	}
+	return writeDiff(history, rw)
+}
+
+func (d *Delta) HandleSubscribe(rw0 io.ReadWriter) error {
+	rw := bufio.NewReadWriter(
+		bufio.NewReaderSize(rw0, 128),
+		bufio.NewWriterSize(rw0, 128),
+	)
+
+	version, err := binary.ReadVarint(rw)
+	if err != nil {
+		return err
+	}
+
+	notify, unsub := d.Subscribe()
+	defer unsub()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		rw.ReadByte()
+		cancel()
+	}()
+
+	for {
+		s := d.getSnapshot()
+		if err := syncVersion(s, int(version), rw); err != nil {
+			return err
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-notify:
+		}
+	}
+}
+
 func (d *Delta) HandlePublish(rw io.ReadWriter) error {
 	p := &deltaPublish{
 		d: d,
-		rw: bufio.NewReadWriter(
-			bufio.NewReaderSize(rw, 128),
-			bufio.NewWriterSize(rw, 128),
-		),
 	}
 	return p.handle()
 }
