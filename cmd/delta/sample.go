@@ -6,13 +6,14 @@ import (
 	"github.com/nareix/delta"
 )
 
-func oplogs(sw *delta.SnapshotWriter, set, remove []string) *delta.DiffTreeWriter {
-	c := &delta.DiffTreeWriter{W: sw}
+func oplogs(set, remove []string) *delta.DiffTreeWriter {
+	c := &delta.DiffTreeWriter{}
+	c.Reset()
 	for _, k := range set {
-		c.WriteOplogSet([]byte(k), []byte(k))
+		c.Set([]byte(k), []byte(k))
 	}
 	for _, k := range remove {
-		c.WriteOplogRemove([]byte(k))
+		c.Remove([]byte(k))
 	}
 	return c
 }
@@ -22,19 +23,12 @@ func testSimple() {
 	tw := &delta.TreeWriter{}
 	trees := []int{}
 
-	set := func(c *delta.DiffTreeWriter, s string) {
-		c.WriteOplogSet([]byte(s), []byte(s))
-	}
-
 	if true {
-		c := &delta.DiffTreeWriter{W: sw}
-		set(c, "123")
-		set(c, "12")
-		set(c, "111")
-		set(c, "1112")
-		set(c, "2435")
-
-		h := c.WriteTree(tw)
+		c := oplogs([]string{"123", "12", "111", "1112", "2435"}, nil)
+		h := c.WriteTree(tw, sw)
+		// for _, o := range c.Oplogs {
+		// 	fmt.Println("o", o.Value(sw.Slots))
+		// }
 		trees = append(trees, h)
 
 		fmt.Println("tree", 0)
@@ -42,15 +36,8 @@ func testSimple() {
 	}
 
 	if true {
-		c := &delta.DiffTreeWriter{W: sw}
-		set(c, "433")
-		set(c, "443")
-		set(c, "4")
-		set(c, "119")
-		set(c, "120")
-		c.WriteOplogRemove([]byte("123"))
-
-		h := c.WriteTree(tw)
+		c := oplogs([]string{"433", "443", "4", "119", "120"}, []string{"123"})
+		h := c.WriteTree(tw, sw)
 		trees = append(trees, h)
 
 		fmt.Println("tree", 1)
@@ -75,21 +62,21 @@ func testCompact() {
 	tw := &delta.TreeWriter{}
 
 	tree := delta.WriteEmptyTree(sw)
-	used := &delta.Used{}
-	c0 := delta.Commit{Flags: delta.TagCommitTree}
-	c0.Tree = int32(tree)
+	usage := &delta.Usage{}
+	c0 := delta.Commit{Flags: delta.TagCommitFull}
+	c0.FullTree = int32(tree)
 	parent := c0.Write(sw)
 
 	commit := func(set, remove []string) {
-		diff := oplogs(sw, set, remove)
+		diff := oplogs(set, remove)
 		c := delta.Commit{}
-		c.Flags = delta.TagCommitTree | delta.TagCommitParent | delta.TagCommitDiff
-		c.DiffTree = int32(diff.WriteTree(tw))
-		c.DiffUsedOff = int32(sw.WriteVarintArray(diff.Used.Used))
-		used.Add(diff.Used)
-		tree = delta.MergeTree(sw.Slots, tree, int(c.DiffTree), used, tw, sw)
-		c.Tree = int32(tree)
-		c.UsedOff = int32(sw.WriteVarintArray(used.Used))
+		c.Flags = delta.TagCommitFull | delta.TagCommitParent | delta.TagCommitDiff
+		c.DiffTree = int32(diff.WriteTree(tw, sw))
+		c.DiffUsageOff = int32(sw.WriteVarintArray(diff.Usage.Usage))
+		usage.Add(diff.Usage)
+		tree = delta.MergeTree(sw.Slots, tree, int(c.DiffTree), usage, tw, sw)
+		c.FullTree = int32(tree)
+		c.FullUsageOff = int32(sw.WriteVarintArray(usage.Usage))
 		c.Parent = int32(parent)
 		c.SlotsLenOff = int32(sw.WriteVarintArray(sw.SlotsLen))
 		parent = c.Write(sw)
@@ -102,13 +89,13 @@ func testCompact() {
 	history := delta.ReadHistory(sw.Slots, parent, 2)
 	for i, c := range history {
 		fmt.Println("history", i)
-		if c.Flags&delta.TagCommitTree != 0 {
-			fmt.Println("used", delta.ReadVarintArray(nil, sw.Slots, int(c.UsedOff)))
+		if c.Flags&delta.TagCommitFull != 0 {
+			fmt.Println("used", delta.ReadVarintArray(nil, sw.Slots, int(c.FullUsageOff)))
 			// fmt.Println("tree", i)
 			// delta.DebugDfsTree(sw.Slots, int(c.Tree))
 		}
 		if c.Flags&delta.TagCommitDiff != 0 {
-			fmt.Println("diff used", delta.ReadVarintArray(nil, sw.Slots, int(c.DiffUsedOff)))
+			fmt.Println("diff used", delta.ReadVarintArray(nil, sw.Slots, int(c.DiffUsageOff)))
 			// fmt.Println("diff tree", i)
 			// delta.DebugDfsTree(sw.Slots, int(c.DiffTree))
 		}
@@ -116,7 +103,7 @@ func testCompact() {
 
 	sw2, c2, _ := delta.Compact(sw.Slots, history, tw)
 	fmt.Println("sw2", sw2.Slot0Len)
-	delta.DebugDfsTree(sw2.Slots, int(c2.Tree))
+	delta.DebugDfsTree(sw2.Slots, int(c2.FullTree))
 }
 
 func testDelta() {
