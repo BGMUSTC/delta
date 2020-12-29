@@ -24,7 +24,7 @@ https://github.com/nareix/delta/blob/0591750e9fcd40d84149a3634a141b9b2094358d/cm
 
 ![](basic.png)
 
-基本的数据结构是 immutable 的 trie 树：
+基本的数据结构是 immutable 的 trie 树（带路径压缩）：
 
 当 set/remove 操作后，新建一棵树，这棵树只有一部分节点是指向新的数据，其他的都指向旧的数据和中间节点，因为它们没有变化，然后把新建的树丢给使用者使用。
 
