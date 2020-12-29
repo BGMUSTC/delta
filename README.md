@@ -76,11 +76,13 @@ Compact 的会统计每个 slot 里有效 value 的占比。然后占比大的�
 
 有效 value 占比计算是在每次 MergeTree 之后能得出来，否则扫描一次全树开销较大。原理是：
 
-已知本次 Commit 的总 value 大小
+已知上次全量的总 value 大小
 
-已知 MergeTree 时候变更的 value 大小的差值（比如某节点之前 set 的是 "123" 现在是 "2"）
+已知本次增量的总 value 大小
 
-这两个相加可以得出。
+已知本次变更的 value 大小的差值（比如某节点之前 set 的是 "123" 现在是 "2"）
+
+这三个相加可以得出。
 
 TODO：Compact 的优化可以针对实时性场景，比如落后 3s 的 Commit 全部丢掉。
 
