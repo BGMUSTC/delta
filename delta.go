@@ -40,6 +40,7 @@ const (
 	debugBuildCommitTree = false
 	debugMergeTree       = false
 	debugCompact         = false
+	debugDelta           = false
 )
 
 var ErrProto = fmt.Errorf("proto error")
@@ -1705,8 +1706,6 @@ func (d *Delta) notifyAll() {
 		return true
 	})
 }
-
-const debugDelta = false
 
 func syncVersion(p *SyncProto, s *Snapshot, oldversion int) (int, error) {
 	c := ReadCommit(s.Slots, s.HeadOff)
